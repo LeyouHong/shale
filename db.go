@@ -5,14 +5,14 @@
 //
 // # 现在能用到哪一步
 //
-// 项目按里程碑推进（见 DESIGN.md 第五节），当前处于 M1：
-// Put / Get / Delete / Write 已经可用，但数据【只在内存里】——
-// 还没有 WAL，进程退出就全没了。
+// 项目按里程碑推进（见 DESIGN.md 第五节），当前处于 M2：
+// 读写可用，数据能活过重启（含 kill -9），但还【全部堆在内存里】——
+// 没有 SSTable，MemTable 和 WAL 都会一直涨，重启要重放全部日志。
 //
 //	M0 ✓ 骨架、Options、错误、内部 key 编码、Batch 格式
 //	M1 ✓ 跳表 + MemTable（纯内存的读写路径）
-//	M2   WAL + 崩溃恢复          ← 数据开始能活过重启
-//	M3   SSTable 读写
+//	M2 ✓ WAL + 崩溃恢复
+//	M3   SSTable 读写            ← 数据开始能落盘，MemTable 才能被清空
 //	...
 //
 // 还没实现的接口会返回 ErrNotImplemented（NewIterator / Flush / CompactAll）。
@@ -35,6 +35,7 @@ import (
 
 	"github.com/leyouhong/shale/internal/ikey"
 	"github.com/leyouhong/shale/internal/memtable"
+	"github.com/leyouhong/shale/internal/wal"
 )
 
 // DB 是一个打开的数据库实例。
@@ -54,6 +55,18 @@ type DB struct {
 
 	// mem 是当前可写的 MemTable，所有写入先落在这里。
 	mem *memtable.MemTable
+
+	// WAL：写入 MemTable 之前先把 batch 追加到这里，用于崩溃恢复。
+	walFile *os.File
+	wal     *wal.Writer
+	walNum  uint64
+
+	// recovered 是启动时从 WAL 重放出来的记录条数。
+	recovered int
+
+	// recoverWarning 记录恢复过程中遇到的问题（比如日志尾部损坏）。
+	// 不是致命错误 —— 已经恢复的数据仍然可用 —— 但调用方应该知道。
+	recoverWarning error
 }
 
 // Open 打开（或创建）一个数据库。
@@ -96,11 +109,26 @@ func Open(dir string, opts *Options) (*DB, error) {
 	db := &DB{
 		dir:  abs,
 		opts: opts,
-		seq:  0, // M2 起改为从 Manifest / WAL 恢复
 		mem:  memtable.New(),
+	}
+
+	// 重放 WAL：把上次运行留下的数据读回 MemTable，并恢复 seq。
+	// 全新的数据库这一步什么也不做，只是开一个空日志。
+	if err := db.recover(); err != nil {
+		db.closeWAL()
+		return nil, err
 	}
 	return db, nil
 }
+
+// RecoveredEntries 返回启动时从 WAL 重放出来的记录条数。
+func (db *DB) RecoveredEntries() int { return db.recovered }
+
+// RecoverWarning 返回恢复过程中遇到的问题，没有问题时返回 nil。
+//
+// 典型情况是日志尾部损坏 —— 此时已恢复的数据仍然可用，
+// 但调用方可能想记录一条告警。
+func (db *DB) RecoverWarning() error { return db.recoverWarning }
 
 // Close 关闭数据库，释放所有资源。
 // 关闭后再调用任何方法都会返回 ErrClosed。重复 Close 是安全的。
@@ -111,8 +139,8 @@ func (db *DB) Close() error {
 		return nil
 	}
 	db.closed = true
-	// M2 起：这里要刷 WAL、等后台 compaction 退出、关闭所有打开的文件
-	return nil
+	// M3 起：这里还要等后台 flush / compaction 退出
+	return db.closeWAL()
 }
 
 // Dir 返回数据目录的绝对路径。
@@ -183,6 +211,9 @@ func (db *DB) Write(b *Batch) error {
 	if b == nil || b.Empty() {
 		return nil
 	}
+	if db.opts.ReadOnly {
+		return ErrReadOnly
+	}
 	// 先校验，避免写了一半才发现某条记录非法
 	if err := b.Iterate(func(_ ikey.Kind, key, value []byte) error {
 		if err := validateKey(key); err != nil {
@@ -205,10 +236,23 @@ func (db *DB) Write(b *Batch) error {
 	base := db.seq + 1
 	b.SetSeq(base)
 
-	// M2 起：这里要先把 b.Bytes() 追加到 WAL 并（可选）fsync，
-	// 成功之后才允许往 MemTable 写 —— 顺序不能反，
-	// 否则崩溃时会出现"内存里有、日志里没有"的数据。
+	// ① 先落日志。顺序绝不能反：
+	//    先写 MemTable 的话，两步之间崩溃就会出现「内存里有、日志里没有」，
+	//    而内存里的东西马上也没了 —— 数据凭空消失。
+	if db.wal != nil {
+		if err := db.wal.Write(b.Bytes()); err != nil {
+			return fmt.Errorf("shale: 写 WAL 失败: %w", err)
+		}
+		if db.opts.SyncWAL {
+			// fsync 之后才敢说"数据落盘了"，断电也不丢。
+			// 代价是慢一个数量级，所以默认关闭。
+			if err := db.walFile.Sync(); err != nil {
+				return fmt.Errorf("shale: WAL fsync 失败: %w", err)
+			}
+		}
+	}
 
+	// ② 再写内存。到这一步就算进程立刻崩溃，重启也能从日志恢复。
 	var i uint64
 	if err := b.Iterate(func(kind ikey.Kind, key, value []byte) error {
 		db.mem.Add(base+i, kind, key, value)

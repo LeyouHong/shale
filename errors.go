@@ -28,6 +28,9 @@ var (
 	// ErrInvalidOptions 表示 Options 里的配置项不合法。
 	ErrInvalidOptions = errors.New("shale: invalid options")
 
+	// ErrReadOnly 表示数据库以只读模式打开，不接受写入。
+	ErrReadOnly = errors.New("shale: database is read-only")
+
 	// ErrNotImplemented 表示该功能还没实现（当前里程碑尚未覆盖）。
 	// 随着里程碑推进，返回这个错误的地方会逐个消失。
 	ErrNotImplemented = errors.New("shale: not implemented yet")
