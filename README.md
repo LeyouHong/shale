@@ -19,7 +19,7 @@
 | **M2** | **WAL + 崩溃恢复** | ✅ 完成 |
 | **M3** | **SSTable 读写 + flush** | ✅ 完成 |
 | **M4** | **Manifest + Version + 文件引用计数** | ✅ 完成 |
-| M5 | Iterator + 多路归并 | ⬜ |
+| **M5** | **Iterator + 多路归并** | ✅ 完成 |
 | M6 | Compaction（简单全量合并） | ⬜ |
 | M7 | Leveled Compaction + 分层 | ⬜ |
 | M8 | 布隆过滤器 + Block Cache | ⬜ |
@@ -35,8 +35,11 @@ M4 把元数据交给 Manifest：**目录里有什么文件不算数，Manifest 
 崩溃留下的孤儿文件因此会被自动忽略并清理。同时建立了 Version 的引用计数，
 为 compaction 安全删文件打好地基。
 
-**当前的限制**：SSTable **只增不减**。测试里 276 个存活 key 散落在
-477 个文件中，一次 `Get` 最坏要问遍所有文件——这正是 compaction（M6）要解决的。
+M5 实现了多路归并迭代器，范围扫描可用。
+
+**当前的限制**：SSTable **只增不减**。测试里 598 个存活 key 散落在
+136 个文件中，一次 `Get` 最坏要问遍所有文件，一次扫描要同时打开所有文件——
+这正是 compaction（M6）要解决的。
 
 当前实测：
 
@@ -109,7 +112,7 @@ shale/
     ├── sstable/     磁盘上的有序文件               【第 3 步】    ✅
     ├── bloom/       布隆过滤器                     【第 9 步】
     ├── cache/       Block 缓存
-    ├── iterator/    内部迭代器 + 多路归并           【第 6 步】
+    ├── iterator/    内部迭代器 + 多路归并           【第 6 步】✅
     ├── version/     版本管理、Manifest、引用计数    【第 8 步】✅
     └── compaction/  合并策略与执行                 【第 6~8 步】
 ```

@@ -5,8 +5,8 @@
 //
 // # 现在能用到哪一步
 //
-// 项目按里程碑推进（见 DESIGN.md 第五节），当前处于 M4：
-// 元数据由 Manifest 管理，文件的生效与否不再看目录里有什么。
+// 项目按里程碑推进（见 DESIGN.md 第五节），当前处于 M5：
+// 点查和范围扫描都可用，元数据由 Manifest 管理。
 // 但 SSTable 仍然【只增不减】—— 没有 compaction，文件会越堆越多，
 // 一次 Get 最坏要问遍所有文件，读性能随文件数线性退化。
 //
@@ -15,7 +15,7 @@
 //	M2 ✓ WAL + 崩溃恢复
 //	M3 ✓ SSTable 读写 + flush
 //	M4 ✓ Manifest + Version + 文件引用计数
-//	M5   Iterator + 多路归并
+//	M5 ✓ Iterator + 多路归并
 //	M6   Compaction              ← 文件数终于能降下来
 //	...
 //
@@ -338,20 +338,6 @@ func (db *DB) Write(b *Batch) error {
 	// 真实引擎会交给后台 goroutine 并新建一个 MemTable 立刻接收写入，
 	// 本项目留到 M9 —— 先把正确性做对。
 	return db.maybeFlush()
-}
-
-// NewIterator 创建一个遍历全部数据的迭代器。
-//
-// 迭代器看到的是【创建那一刻】的数据快照，之后的写入不会影响它。
-// 用完必须调用 Close 释放资源，否则它引用的 SSTable 文件无法被 compaction 删除。
-func (db *DB) NewIterator() (Iterator, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	if db.closed {
-		return nil, ErrClosed
-	}
-	// M5 起：多路归并 MemTable + 各层 SSTable
-	return nil, ErrNotImplemented
 }
 
 // Flush 强制把当前 MemTable 刷成 SSTable。主要用于测试和调试。

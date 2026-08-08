@@ -173,3 +173,11 @@ func (i *Iterator) Kind() ikey.Kind { return ikey.GetKind(i.it.Key()) }
 
 // Value 返回当前记录的值。墓碑的值为空。
 func (i *Iterator) Value() []byte { return i.it.Value() }
+
+// Error 永远返回 nil —— MemTable 全在内存里，遍历不会失败。
+// 有这个方法是为了满足 internal/iterator 的 Iterator 接口，
+// 好和 SSTable 的迭代器一起参与多路归并。
+func (i *Iterator) Error() error { return nil }
+
+// Close 无事可做，同样是为了满足接口。
+func (i *Iterator) Close() error { return nil }
