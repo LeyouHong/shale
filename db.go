@@ -5,10 +5,12 @@
 //
 // # 现在能用到哪一步
 //
-// 项目按里程碑推进（见 DESIGN.md 第五节），当前处于 M6：
-// 读、写、扫描、崩溃恢复、compaction 都已具备，是一个能用的 KV 引擎了。
-// 目前 compaction 用的是最笨的策略（L0 满了就重写整个 L1），
-// M7 会换成真正的 Leveled 分层。
+// 项目按里程碑推进（见 DESIGN.md 第五节），当前处于 M7：
+// 读、写、扫描、崩溃恢复、分层 compaction 都已具备，
+// 是一个结构完整的 LSM 引擎了。
+//
+// 还差两块性能件：布隆过滤器（M8，让"查不存在的 key"不必读盘）
+// 和并发优化（M9，目前写入串行、compaction 同步执行）。
 //
 //	M0 ✓ 骨架、Options、错误、内部 key 编码、Batch 格式
 //	M1 ✓ 跳表 + MemTable（纯内存的读写路径）
@@ -17,7 +19,7 @@
 //	M4 ✓ Manifest + Version + 文件引用计数
 //	M5 ✓ Iterator + 多路归并
 //	M6 ✓ Compaction（简单全量合并）
-//	M7   Leveled Compaction + 分层
+//	M7 ✓ Leveled Compaction + 分层
 //	M8   布隆过滤器 + Block Cache
 //	M9   并发 + 压测
 //
@@ -81,6 +83,10 @@ type DB struct {
 
 	// tables 缓存已打开的 SSTable 句柄，避免每次查询都重新打开文件。
 	tables tableCache
+
+	// compactPointer 记录每层上次 compaction 停在哪个 key，用于轮转。
+	// 不轮转的话同一段 key 会被反复重写，后面的数据永远沉不下去。
+	compactPointer [version.MaxLevels][]byte
 
 	// 统计
 	flushCount       int64

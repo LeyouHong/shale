@@ -286,13 +286,19 @@ func (db *DB) getFromTables(v *version.Version, key []byte, snapshot uint64) ([]
 			}
 			continue
 		}
-		// L1 及以下层内不重叠，一个 key 最多落在一个文件里。
-		// M7 分层之后这里会换成二分查找。
-		for _, f := range files {
-			val, res, err := db.lookupFile(f, key, snapshot)
-			if err != nil || res != ikey.NotFound {
-				return val, res, err
-			}
+		// L1 及以下：层内不重叠且按 key 排好序，
+		// 所以一个 key 最多落在【一个】文件里，可以二分定位。
+		//
+		// 这是分层带来的读性能收益 —— 从"遍历该层所有文件"
+		// 变成 O(log n) 次比较、只读一个文件。
+		// 一层有几千个文件时，差距是决定性的。
+		f := v.FindFile(level, key)
+		if f == nil {
+			continue // 这一层没有能覆盖它的文件
+		}
+		val, res, err := db.lookupFile(f, key, snapshot)
+		if err != nil || res != ikey.NotFound {
+			return val, res, err
 		}
 	}
 	return nil, ikey.NotFound, nil

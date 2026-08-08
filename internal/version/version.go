@@ -122,14 +122,45 @@ func (v *Version) OverlappingFiles(level int, smallest, largest []byte) []*FileM
 	return out
 }
 
-// String 输出各层的文件分布，便于观察。
+// String 输出各层的概况：文件数、总大小、覆盖的 key 范围。
+//
+// 刻意【不】逐个列出文件 —— 一个跑起来的库某层可能有几百上千个文件，
+// 全打出来只会把日志刷爆。要看细节用 Detail。
 func (v *Version) String() string {
+	var b strings.Builder
+	for level := 0; level < len(v.files); level++ {
+		files := v.files[level]
+		if len(files) == 0 {
+			continue
+		}
+		lo, hi := shortKey(files[0].Smallest), shortKey(files[0].Largest)
+		var size int64
+		for _, f := range files {
+			size += f.Size
+			if s := shortKey(f.Smallest); s < lo {
+				lo = s
+			}
+			if s := shortKey(f.Largest); s > hi {
+				hi = s
+			}
+		}
+		fmt.Fprintf(&b, "L%d: %3d 个文件, %8d 字节, 范围 %s~%s\n",
+			level, len(files), size, lo, hi)
+	}
+	if b.Len() == 0 {
+		return "(空)\n"
+	}
+	return b.String()
+}
+
+// Detail 逐个列出所有文件，只在调试少量文件时用。
+func (v *Version) Detail() string {
 	var b strings.Builder
 	for level := 0; level < len(v.files); level++ {
 		if len(v.files[level]) == 0 {
 			continue
 		}
-		fmt.Fprintf(&b, "L%d: %d 个文件", level, len(v.files[level]))
+		fmt.Fprintf(&b, "L%d:", level)
 		for _, f := range v.files[level] {
 			fmt.Fprintf(&b, " [%06d %s~%s]", f.Num,
 				shortKey(f.Smallest), shortKey(f.Largest))
@@ -211,4 +242,72 @@ func (v *Version) sortLevels() {
 			return ikey.Compare(files[i].Smallest, files[j].Smallest) < 0
 		})
 	}
+}
+
+// FindFile 在 L1 及以下的某一层里二分查找可能包含 userKey 的文件。
+//
+// 这一层的文件【互不重叠且按 key 排序】，所以一个 key 最多落在一个文件里，
+// 可以二分定位 —— 这正是分层带来的读性能收益：
+// 从"遍历该层所有文件"降到 O(log n) 次比较、且只读一个文件。
+//
+// L0 不适用（文件互相重叠，必须逐个问），传 0 会 panic。
+func (v *Version) FindFile(level int, userKey []byte) *FileMeta {
+	if level == 0 {
+		panic("version: L0 文件互相重叠，不能二分查找")
+	}
+	files := v.Files(level)
+
+	// 找第一个 Largest >= userKey 的文件
+	lo, hi := 0, len(files)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if bytes.Compare(ikey.UserKey(files[mid].Largest), userKey) < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo >= len(files) {
+		return nil // 比这一层所有 key 都大
+	}
+	// 还要确认它的下界也覆盖得到 —— 目标可能落在两个文件之间的空隙里
+	if bytes.Compare(userKey, ikey.UserKey(files[lo].Smallest)) < 0 {
+		return nil
+	}
+	return files[lo]
+}
+
+// CheckInvariants 校验版本的内部一致性，供测试和调试使用。
+//
+// 检查两条铁律：
+//
+//	① L1 及以下，同一层的文件 key 范围【不能重叠】——
+//	   这是分层的根本前提，破了的话二分查找就会漏数据
+//	② 每个文件自身的 Smallest <= Largest
+//
+// L0 不检查重叠，它本来就允许重叠（都是 MemTable 直接刷下来的）。
+func (v *Version) CheckInvariants() error {
+	for level := 0; level < len(v.files); level++ {
+		files := v.files[level]
+
+		for _, f := range files {
+			if ikey.Compare(f.Smallest, f.Largest) > 0 {
+				return fmt.Errorf("L%d 文件 %06d 的 key 范围颠倒了：%s > %s",
+					level, f.Num, shortKey(f.Smallest), shortKey(f.Largest))
+			}
+		}
+
+		if level == 0 {
+			continue // L0 允许重叠
+		}
+		for i := 1; i < len(files); i++ {
+			prev, cur := files[i-1], files[i]
+			if bytes.Compare(ikey.UserKey(prev.Largest), ikey.UserKey(cur.Smallest)) >= 0 {
+				return fmt.Errorf("L%d 的文件 %06d[..%s] 和 %06d[%s..] key 范围重叠了",
+					level, prev.Num, shortKey(prev.Largest),
+					cur.Num, shortKey(cur.Smallest))
+			}
+		}
+	}
+	return nil
 }

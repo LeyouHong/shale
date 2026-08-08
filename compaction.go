@@ -67,30 +67,121 @@ func (c *compaction) totalFiles() int { return len(c.inputs[0]) + len(c.inputs[1
 
 // pickCompaction 挑选下一个要做的合并任务，没有就返回 nil。
 //
-// M6 用最笨的策略：L0 攒够文件就把【L0 全部 + L1 全部】合并成新的 L1。
-// 好处是简单、且合并完 L1 天然满足"层内不重叠"；
-// 坏处是每次都要重写整个 L1，数据一多就吃不消。
-// M7 会换成真正的 Leveled：只挑一个文件，带上下层与它重叠的那几个。
+// # 挑哪一层：看 score
+//
+// 每层算一个"拥挤程度"，挑最挤的那层动手：
+//
+//	L0    score = 文件数 / L0CompactionTrigger
+//	L1+   score = 该层字节数 / 该层容量上限
+//
+// L0 为什么按【文件数】而不是字节数算？因为 L0 的文件互相重叠，
+// 每次 Get 都要逐个问一遍 —— 拖慢读的是文件【个数】，和总字节数没关系。
+// L1 及以下层内不重叠，一个 key 最多落在一个文件里，那时才该看容量。
+//
+// # 挑哪些文件
+//
+//	L0    全部参与。文件互相重叠，挑一部分的话，合并结果会和剩下的
+//	      L0 文件产生交错，很难保证正确性。反正 L0 文件数被 trigger
+//	      限制着，全带上代价不大。
+//	L1+   只挑【一个】文件，从上次停下的位置继续（compactPointer 轮转），
+//	      避免总在同一段 key 上反复做功。
+//
+// 然后把下一层所有与之 key 范围重叠的文件卷进来 —— 这一步不能省，
+// 否则合并出来的新文件会和下层残留的文件重叠，破坏"层内不重叠"。
 func (db *DB) pickCompaction() *compaction {
 	v := db.vs.Current()
 
-	if v.NumFiles(0) < db.opts.L0CompactionTrigger {
+	bestLevel, bestScore := -1, 1.0
+	for level := 0; level < version.MaxLevels-1; level++ {
+		var score float64
+		if level == 0 {
+			score = float64(v.NumFiles(0)) / float64(db.opts.L0CompactionTrigger)
+		} else {
+			maxBytes := db.opts.LevelMaxBytes(level)
+			if maxBytes <= 0 {
+				continue
+			}
+			score = float64(v.LevelSize(level)) / float64(maxBytes)
+		}
+		if score >= bestScore {
+			bestLevel, bestScore = level, score
+		}
+	}
+	if bestLevel < 0 {
+		return nil
+	}
+	return db.setupCompaction(v, bestLevel)
+}
+
+// setupCompaction 为指定层组装一个合并任务。
+func (db *DB) setupCompaction(v *version.Version, level int) *compaction {
+	c := &compaction{level: level, outputLevel: level + 1}
+
+	if level == 0 {
+		c.inputs[0] = append([]*version.FileMeta(nil), v.Files(0)...)
+	} else {
+		f := db.pickFileRoundRobin(v, level)
+		if f == nil {
+			return nil
+		}
+		c.inputs[0] = []*version.FileMeta{f}
+	}
+	if len(c.inputs[0]) == 0 {
 		return nil
 	}
 
-	c := &compaction{level: 0, outputLevel: 1}
-	c.inputs[0] = append([]*version.FileMeta(nil), v.Files(0)...)
-	c.inputs[1] = append([]*version.FileMeta(nil), v.Files(1)...)
+	// 把下一层所有与输入范围重叠的文件卷进来
+	smallest, largest := userKeyRange(c.inputs[0])
+	c.inputs[1] = v.OverlappingFiles(c.outputLevel, smallest, largest)
 
-	// 输出层以下还有数据吗？没有的话就能安全地扔掉墓碑。
+	// 输出层以下还有数据吗？没有的话才能安全丢弃墓碑。
 	c.isBottom = true
-	for level := c.outputLevel + 1; level < version.MaxLevels; level++ {
-		if v.NumFiles(level) > 0 {
+	for l := c.outputLevel + 1; l < version.MaxLevels; l++ {
+		if v.NumFiles(l) > 0 {
 			c.isBottom = false
 			break
 		}
 	}
 	return c
+}
+
+// pickFileRoundRobin 从上次停下的位置挑一个文件，实现轮转。
+//
+// 不轮转的话（比如永远挑第一个），同一段 key 会被反复重写，
+// 而后面的数据永远沉不下去。
+func (db *DB) pickFileRoundRobin(v *version.Version, level int) *version.FileMeta {
+	files := v.Files(level)
+	if len(files) == 0 {
+		return nil
+	}
+	ptr := db.compactPointer[level]
+	if len(ptr) > 0 {
+		for _, f := range files {
+			if bytes.Compare(ikey.UserKey(f.Largest), ptr) > 0 {
+				return f
+			}
+		}
+	}
+	// 指针已经绕完一圈，从头再来
+	return files[0]
+}
+
+// userKeyRange 返回一组文件覆盖的用户 key 范围。
+func userKeyRange(files []*version.FileMeta) (smallest, largest []byte) {
+	for i, f := range files {
+		lo, hi := ikey.UserKey(f.Smallest), ikey.UserKey(f.Largest)
+		if i == 0 {
+			smallest, largest = lo, hi
+			continue
+		}
+		if bytes.Compare(lo, smallest) < 0 {
+			smallest = lo
+		}
+		if bytes.Compare(hi, largest) > 0 {
+			largest = hi
+		}
+	}
+	return smallest, largest
 }
 
 // maybeCompact 在需要时执行 compaction，直到没有任务为止。
@@ -206,6 +297,13 @@ func (db *DB) doCompaction(c *compaction) error {
 	db.compactionCount++
 	db.droppedEntries += int64(dropped)
 
+	// 记下这次合并到哪个 key 为止，下次从这里继续
+	if len(out.files) > 0 {
+		last := out.files[len(out.files)-1].Largest
+		db.compactPointer[c.level] = append(db.compactPointer[c.level][:0],
+			ikey.UserKey(last)...)
+	}
+
 	// ④ 旧文件现在可以回收了 —— 但只有当没有迭代器还在用它们的时候。
 	//    cleanupObsoleteFiles 会问 LiveFiles()，那里考虑了所有存活的 Version。
 	return db.cleanupObsoleteFiles()
@@ -305,30 +403,56 @@ func (o *compactionOutput) abort() {
 	}
 }
 
-// compactAllLocked 反复合并，直到所有数据都沉到最底层的一个层里。
+// compactAllLocked 反复合并，直到所有数据都沉到最底层。
 // 调用方必须已持有写锁。
 //
 // 这个操作很重（要重写全部数据），只适合测试或维护窗口。
 func (db *DB) compactAllLocked() error {
-	// 先按正常策略合并到没有任务为止
+	// 先按正常策略把该合的都合了
 	if err := db.maybeCompact(); err != nil {
 		return err
 	}
 
-	// 再把残留在 L0 的少量文件也并下去 —— 正常策略要求攒够
-	// L0CompactionTrigger 个才动手，手动全量合并则不管数量。
-	v := db.vs.Current()
-	if v.NumFiles(0) == 0 {
-		return nil
-	}
-	c := &compaction{level: 0, outputLevel: 1, isBottom: true}
-	c.inputs[0] = append([]*version.FileMeta(nil), v.Files(0)...)
-	c.inputs[1] = append([]*version.FileMeta(nil), v.Files(1)...)
-	for level := 2; level < version.MaxLevels; level++ {
-		if v.NumFiles(level) > 0 {
-			c.isBottom = false
-			break
+	// 再逐层往下推，直到只剩最底下那一层有数据。
+	// 正常策略要求达到阈值才动手，手动全量合并则不管阈值。
+	for round := 0; round < version.MaxLevels; round++ {
+		v := db.vs.Current()
+
+		// 找到最上面那个还有文件的层
+		src := -1
+		for level := 0; level < version.MaxLevels-1; level++ {
+			if v.NumFiles(level) > 0 {
+				src = level
+				break
+			}
+		}
+		if src < 0 {
+			return nil // 数据都在最底层了
+		}
+		// 下面还有文件吗？没有就说明已经合并完了
+		hasLower := false
+		for level := src + 1; level < version.MaxLevels; level++ {
+			if v.NumFiles(level) > 0 {
+				hasLower = true
+				break
+			}
+		}
+		if !hasLower && v.NumFiles(src) == 1 {
+			return nil // 只剩一个文件且下面是空的，没什么可合的了
+		}
+
+		c := &compaction{level: src, outputLevel: src + 1, isBottom: true}
+		c.inputs[0] = append([]*version.FileMeta(nil), v.Files(src)...)
+		c.inputs[1] = append([]*version.FileMeta(nil), v.Files(src+1)...)
+		for l := src + 2; l < version.MaxLevels; l++ {
+			if v.NumFiles(l) > 0 {
+				c.isBottom = false
+				break
+			}
+		}
+		if err := db.doCompaction(c); err != nil {
+			return err
 		}
 	}
-	return db.doCompaction(c)
+	return nil
 }
