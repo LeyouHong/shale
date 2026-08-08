@@ -255,7 +255,13 @@ func (db *DB) flushLocked() error {
 	db.diskBytesWritten += meta.Size
 
 	// ⑤ 旧 WAL 和废弃文件现在可以清了
-	return db.cleanupObsoleteFiles()
+	if err := db.cleanupObsoleteFiles(); err != nil {
+		return err
+	}
+
+	// ⑥ 刚往 L0 加了一个文件，可能已经攒够触发合并的数量了。
+	//    同步做 —— M9 会改成后台 goroutine。
+	return db.maybeCompact()
 }
 
 // getFromTables 按【从新到旧】的顺序在所有 SSTable 里查找。

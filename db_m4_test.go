@@ -260,9 +260,14 @@ func TestStatsPerLevel(t *testing.T) {
 	if st.Levels[0].Level != 0 {
 		t.Error("第一项应该是 L0")
 	}
-	if st.Levels[0].NumFiles != numTables(db) {
-		t.Errorf("L0 文件数 = %d，与 Version 里的 %d 不一致",
-			st.Levels[0].NumFiles, numTables(db))
+	// 各层文件数之和应该等于总文件数。
+	// （M6 起数据会被 compaction 推到 L1，不能只看 L0。）
+	total := 0
+	for _, l := range st.Levels {
+		total += l.NumFiles
+	}
+	if total != numTables(db) {
+		t.Errorf("各层文件数之和 = %d，与 Version 里的 %d 不一致", total, numTables(db))
 	}
 	t.Logf("\n%s", st)
 }

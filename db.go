@@ -5,10 +5,10 @@
 //
 // # 现在能用到哪一步
 //
-// 项目按里程碑推进（见 DESIGN.md 第五节），当前处于 M5：
-// 点查和范围扫描都可用，元数据由 Manifest 管理。
-// 但 SSTable 仍然【只增不减】—— 没有 compaction，文件会越堆越多，
-// 一次 Get 最坏要问遍所有文件，读性能随文件数线性退化。
+// 项目按里程碑推进（见 DESIGN.md 第五节），当前处于 M6：
+// 读、写、扫描、崩溃恢复、compaction 都已具备，是一个能用的 KV 引擎了。
+// 目前 compaction 用的是最笨的策略（L0 满了就重写整个 L1），
+// M7 会换成真正的 Leveled 分层。
 //
 //	M0 ✓ 骨架、Options、错误、内部 key 编码、Batch 格式
 //	M1 ✓ 跳表 + MemTable（纯内存的读写路径）
@@ -16,8 +16,10 @@
 //	M3 ✓ SSTable 读写 + flush
 //	M4 ✓ Manifest + Version + 文件引用计数
 //	M5 ✓ Iterator + 多路归并
-//	M6   Compaction              ← 文件数终于能降下来
-//	...
+//	M6 ✓ Compaction（简单全量合并）
+//	M7   Leveled Compaction + 分层
+//	M8   布隆过滤器 + Block Cache
+//	M9   并发 + 压测
 //
 // 还没实现的接口会返回 ErrNotImplemented（NewIterator / Flush / CompactAll）。
 //
@@ -82,6 +84,8 @@ type DB struct {
 
 	// 统计
 	flushCount       int64
+	compactionCount  int64
+	droppedEntries   int64
 	diskBytesWritten int64
 	userBytesWritten int64
 }
@@ -361,7 +365,14 @@ func (db *DB) CompactAll() error {
 	if db.closed {
 		return ErrClosed
 	}
-	return ErrNotImplemented // M6
+	if db.opts.ReadOnly {
+		return ErrReadOnly
+	}
+	// 先把内存里的刷下去，再合并 —— 否则 MemTable 里的数据参与不进来
+	if err := db.flushLocked(); err != nil {
+		return err
+	}
+	return db.compactAllLocked()
 }
 
 // Stats 返回当前的内部状态，用于观察 LSM 的运行情况。
@@ -372,7 +383,7 @@ func (db *DB) Stats() Stats {
 		MemTableSize:     db.mem.Size(),
 		UserBytesWritten: db.userBytesWritten,
 		DiskBytesWritten: db.diskBytesWritten,
-		CompactionCount:  db.flushCount,
+		CompactionCount:  db.compactionCount,
 	}
 	v := db.vs.Current()
 	for level := 0; level < version.MaxLevels; level++ {

@@ -209,14 +209,17 @@ func TestAutoFlush(t *testing.T) {
 		}
 	}
 
-	if numTables(db) < 5 {
-		t.Errorf("只产生了 %d 个 SSTable，自动 flush 似乎没触发", numTables(db))
+	// 注意不能用文件数来判断 flush 是否触发 —— M6 起 compaction
+	// 会把 L0 的文件合并掉，文件数反而是被压下去的。
+	// 要看的是 flush 发生了几次。
+	if db.flushCount < 5 {
+		t.Errorf("只 flush 了 %d 次，自动 flush 似乎没触发", db.flushCount)
 	}
 	if db.mem.Size() >= 16<<10 {
 		t.Errorf("MemTable 大小 %d 超过了阈值，说明没及时 flush", db.mem.Size())
 	}
-	t.Logf("写入 %d 条后产生了 %d 个 SSTable，MemTable 当前 %s",
-		n, numTables(db), humanBytes(db.mem.Size()))
+	t.Logf("写入 %d 条：flush %d 次、compaction %d 次，最终剩 %d 个 SSTable，MemTable 当前 %s",
+		n, db.flushCount, db.compactionCount, numTables(db), humanBytes(db.mem.Size()))
 
 	// 所有数据都要能读到（分散在多个文件和内存里）
 	for i := 0; i < n; i++ {
