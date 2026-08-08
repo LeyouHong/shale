@@ -1,0 +1,22 @@
+# 编译产物
+*.exe
+*.test
+*.out
+/bin/
+/shalectl
+
+# 测试与调试数据
+/testdata/tmp/
+*.sst
+*.log
+MANIFEST-*
+CURRENT
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# 本地索引缓存
+.codebase-memory/
