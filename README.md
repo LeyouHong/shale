@@ -18,7 +18,7 @@
 | **M1** | **跳表 + MemTable**（纯内存的 Put/Get/Delete） | ✅ 完成 |
 | **M2** | **WAL + 崩溃恢复** | ✅ 完成 |
 | **M3** | **SSTable 读写 + flush** | ✅ 完成 |
-| M4 | Manifest + Version + 多文件管理 | ⬜ |
+| **M4** | **Manifest + Version + 文件引用计数** | ✅ 完成 |
 | M5 | Iterator + 多路归并 | ⬜ |
 | M6 | Compaction（简单全量合并） | ⬜ |
 | M7 | Leveled Compaction + 分层 | ⬜ |
@@ -30,6 +30,10 @@ M0 刻意**先把两个最难改的决策落地**——内部 key 编码和 Batc
 
 M1 打通了读写路径。M2 加上 WAL，数据能活过重启——包括 `kill -9`。
 M3 让数据落盘成 SSTable，内存和日志都不再无限增长。
+
+M4 把元数据交给 Manifest：**目录里有什么文件不算数，Manifest 登记过的才生效**。
+崩溃留下的孤儿文件因此会被自动忽略并清理。同时建立了 Version 的引用计数，
+为 compaction 安全删文件打好地基。
 
 **当前的限制**：SSTable **只增不减**。测试里 276 个存活 key 散落在
 477 个文件中，一次 `Get` 最坏要问遍所有文件——这正是 compaction（M6）要解决的。
@@ -106,7 +110,7 @@ shale/
     ├── bloom/       布隆过滤器                     【第 9 步】
     ├── cache/       Block 缓存
     ├── iterator/    内部迭代器 + 多路归并           【第 6 步】
-    ├── version/     版本管理、Manifest、引用计数    【第 8 步】
+    ├── version/     版本管理、Manifest、引用计数    【第 8 步】✅
     └── compaction/  合并策略与执行                 【第 6~8 步】
 ```
 

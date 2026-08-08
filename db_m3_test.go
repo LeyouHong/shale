@@ -12,6 +12,14 @@ import (
 
 // 这个文件是 M3 的验收测试：数据能从内存落到磁盘文件。
 
+// numTables 返回当前【生效】的 SSTable 数量。
+//
+// 注意不能用 len(db.tables) —— 那是懒加载的句柄缓存，
+// 只反映"打开过哪些文件"。哪些文件生效由 Manifest 说了算。
+func numTables(db *DB) int {
+	return db.vs.Current().TotalFiles()
+}
+
 // countFiles 统计目录里某种后缀的文件数。
 func countFiles(t *testing.T, dir, suffix string) int {
 	t.Helper()
@@ -109,8 +117,8 @@ func TestReadFromSSTableAfterRestart(t *testing.T) {
 		t.Errorf("从 WAL 恢复了 %d 条，期望 0（数据应该都在 SSTable 里）",
 			db2.RecoveredEntries())
 	}
-	if len(db2.tables) != 1 {
-		t.Fatalf("加载了 %d 个 SSTable，期望 1 个", len(db2.tables))
+	if numTables(db2) != 1 {
+		t.Fatalf("加载了 %d 个 SSTable，期望 1 个", numTables(db2))
 	}
 
 	for i := 0; i < 300; i++ {
@@ -138,8 +146,8 @@ func TestNewerSSTableWins(t *testing.T) {
 	db.Put([]byte("k"), []byte("v3"))
 	db.Flush()
 
-	if len(db.tables) != 3 {
-		t.Fatalf("应该有 3 个 SSTable，实际 %d 个", len(db.tables))
+	if numTables(db) != 3 {
+		t.Fatalf("应该有 3 个 SSTable，实际 %d 个", numTables(db))
 	}
 	// 必须读到最新的那个
 	mustGet(t, db, "k", "v3")
@@ -165,8 +173,8 @@ func TestTombstoneAcrossSSTables(t *testing.T) {
 	db.Delete([]byte("k"))
 	db.Flush() // 墓碑进了 000003.sst
 
-	if len(db.tables) != 2 {
-		t.Fatalf("应该有 2 个 SSTable，实际 %d 个", len(db.tables))
+	if numTables(db) != 2 {
+		t.Fatalf("应该有 2 个 SSTable，实际 %d 个", numTables(db))
 	}
 	// 查找先问新文件 → 碰到墓碑 → 立刻返回不存在，不再去问老文件
 	mustMiss(t, db, "k")
@@ -201,14 +209,14 @@ func TestAutoFlush(t *testing.T) {
 		}
 	}
 
-	if len(db.tables) < 5 {
-		t.Errorf("只产生了 %d 个 SSTable，自动 flush 似乎没触发", len(db.tables))
+	if numTables(db) < 5 {
+		t.Errorf("只产生了 %d 个 SSTable，自动 flush 似乎没触发", numTables(db))
 	}
 	if db.mem.Size() >= 16<<10 {
 		t.Errorf("MemTable 大小 %d 超过了阈值，说明没及时 flush", db.mem.Size())
 	}
 	t.Logf("写入 %d 条后产生了 %d 个 SSTable，MemTable 当前 %s",
-		n, len(db.tables), humanBytes(db.mem.Size()))
+		n, numTables(db), humanBytes(db.mem.Size()))
 
 	// 所有数据都要能读到（分散在多个文件和内存里）
 	for i := 0; i < n; i++ {

@@ -5,16 +5,16 @@
 //
 // # 现在能用到哪一步
 //
-// 项目按里程碑推进（见 DESIGN.md 第五节），当前处于 M3：
-// 数据能落盘成 SSTable，内存和日志都不再无限增长。
-// 但 SSTable 【只增不减】—— 没有 compaction，文件会越堆越多，
+// 项目按里程碑推进（见 DESIGN.md 第五节），当前处于 M4：
+// 元数据由 Manifest 管理，文件的生效与否不再看目录里有什么。
+// 但 SSTable 仍然【只增不减】—— 没有 compaction，文件会越堆越多，
 // 一次 Get 最坏要问遍所有文件，读性能随文件数线性退化。
 //
 //	M0 ✓ 骨架、Options、错误、内部 key 编码、Batch 格式
 //	M1 ✓ 跳表 + MemTable（纯内存的读写路径）
 //	M2 ✓ WAL + 崩溃恢复
 //	M3 ✓ SSTable 读写 + flush
-//	M4   Manifest + Version      ← 元数据不再靠扫目录
+//	M4 ✓ Manifest + Version + 文件引用计数
 //	M5   Iterator + 多路归并
 //	M6   Compaction              ← 文件数终于能降下来
 //	...
@@ -39,6 +39,7 @@ import (
 
 	"github.com/leyouhong/shale/internal/ikey"
 	"github.com/leyouhong/shale/internal/memtable"
+	"github.com/leyouhong/shale/internal/version"
 	"github.com/leyouhong/shale/internal/wal"
 )
 
@@ -72,13 +73,12 @@ type DB struct {
 	// 不是致命错误 —— 已经恢复的数据仍然可用 —— 但调用方应该知道。
 	recoverWarning error
 
-	// tables 是所有已落盘的 SSTable，按编号从小到大排列。
-	// 编号越大越新，查找时必须【从后往前】问。
-	// M7 分层之后，这里会换成按层组织的结构。
-	tables []*tableFile
+	// vs 管理元数据：当前有哪些文件、各在哪一层、seq 和文件编号。
+	// 「有哪些文件」的唯一权威来源 —— 目录里的文件不算数，Manifest 说了算。
+	vs *version.VersionSet
 
-	// nextFileNum 是下一个可用的文件编号。WAL 和 SSTable 共用一个编号空间。
-	nextFileNum uint64
+	// tables 缓存已打开的 SSTable 句柄，避免每次查询都重新打开文件。
+	tables tableCache
 
 	// 统计
 	flushCount       int64
@@ -124,31 +124,47 @@ func Open(dir string, opts *Options) (*DB, error) {
 	}
 
 	db := &DB{
-		dir:         abs,
-		opts:        opts,
-		mem:         memtable.New(),
-		nextFileNum: 1,
+		dir:    abs,
+		opts:   opts,
+		mem:    memtable.New(),
+		tables: make(tableCache),
+		vs:     version.NewVersionSet(abs),
 	}
 
-	if !opts.ReadOnly {
-		// 清掉上次崩溃留下的半成品 SSTable（.tmp）。
-		// 正式文件是 rename 出来的，要么完整要么不存在，不需要清理。
-		if err := cleanupTempFiles(abs); err != nil {
-			return nil, fmt.Errorf("shale: 清理临时文件失败: %w", err)
-		}
-	}
-
-	// 先打开已经落盘的 SSTable，它们承载着老数据。
-	if err := db.openTables(); err != nil {
-		db.closeTables()
+	// ① 先从 Manifest 恢复元数据：有哪些文件、seq 到哪了、下一个文件号是几。
+	//
+	//    这一步替代了 M3 的「扫描 *.sst」——
+	//    目录里的文件只是物理存在，Manifest 登记过的才是逻辑生效的。
+	//    崩溃时留下的孤儿文件因此会被自然忽略。
+	if _, err := db.vs.Recover(); err != nil {
 		return nil, err
 	}
+	db.seq = db.vs.LastSequence()
 
-	// 再重放 WAL：那是还没来得及落盘的部分，比 SSTable 里的更新。
+	// ② 再重放 WAL：那是还没来得及落盘的部分，比 SSTable 里的更新。
 	if err := db.recover(); err != nil {
 		db.closeWAL()
 		db.closeTables()
 		return nil, err
+	}
+
+	if !opts.ReadOnly {
+		// ③ 换一个新的 Manifest（内容是当前状态的完整快照）。
+		//    每次启动都这么做，Manifest 才不会无限增长。
+		if err := db.vs.CreateManifest(db.walNum); err != nil {
+			db.closeWAL()
+			return nil, err
+		}
+		db.vs.SetLastSequence(db.seq)
+
+		// ④ 清掉孤儿文件：没被 Manifest 登记的 .sst、已经落盘的旧 WAL、
+		//    以及上次崩溃留下的 .tmp 残片。
+		if err := cleanupTempFiles(abs); err != nil {
+			return nil, fmt.Errorf("shale: 清理临时文件失败: %w", err)
+		}
+		if err := db.cleanupObsoleteFiles(); err != nil {
+			return nil, err
+		}
 	}
 	return db, nil
 }
@@ -174,6 +190,9 @@ func (db *DB) Close() error {
 	// M9 起：这里还要等后台 flush / compaction 的 goroutine 退出
 	err := db.closeWAL()
 	if cerr := db.closeTables(); err == nil {
+		err = cerr
+	}
+	if cerr := db.vs.Close(); err == nil {
 		err = cerr
 	}
 	return err
@@ -232,7 +251,7 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	}
 
 	// ② 再逐个问已落盘的 SSTable
-	value, res, err := db.getFromTables(key, snapshot)
+	value, res, err := db.getFromTables(db.vs.Current(), key, snapshot)
 	if err != nil {
 		return nil, err
 	}
@@ -309,6 +328,7 @@ func (db *DB) Write(b *Batch) error {
 		return err
 	}
 	db.seq = base + i - 1
+	db.vs.SetLastSequence(db.seq)
 	db.userBytesWritten += int64(b.Size())
 	db.diskBytesWritten += int64(b.Size())
 
@@ -368,17 +388,18 @@ func (db *DB) Stats() Stats {
 		DiskBytesWritten: db.diskBytesWritten,
 		CompactionCount:  db.flushCount,
 	}
-	// M7 分层之前，所有 SSTable 都算作 L0。
-	var size int64
-	for _, t := range db.tables {
-		size += t.reader.Size()
+	v := db.vs.Current()
+	for level := 0; level < version.MaxLevels; level++ {
+		if v.NumFiles(level) == 0 && level > 0 {
+			continue
+		}
+		st.Levels = append(st.Levels, LevelStats{
+			Level:    level,
+			NumFiles: v.NumFiles(level),
+			Size:     v.LevelSize(level),
+			MaxBytes: db.opts.LevelMaxBytes(level),
+		})
 	}
-	st.Levels = []LevelStats{{
-		Level:    0,
-		NumFiles: len(db.tables),
-		Size:     size,
-		MaxBytes: db.opts.LevelMaxBytes(0),
-	}}
 	return st
 }
 

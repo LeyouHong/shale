@@ -4,22 +4,18 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/leyouhong/shale/internal/ikey"
 	"github.com/leyouhong/shale/internal/memtable"
 	"github.com/leyouhong/shale/internal/sstable"
+	"github.com/leyouhong/shale/internal/version"
 )
 
-// 这个文件负责把 MemTable 落盘成 SSTable。
+// 这个文件负责把 MemTable 落盘成 SSTable，以及管理已打开的文件句柄。
 //
-// 这一步之前，所有数据都堆在内存里、WAL 只增不减；有了 flush 之后：
-//
-//	MemTable 写满 → 冻结 → 写成一个 SSTable 文件 → 丢弃它和对应的 WAL
-//
-// 于是内存占用和日志长度都被限制住了，数据库才真正能长期运行。
+// M4 起，「有哪些文件」这件事不再靠扫目录，而是问 VersionSet ——
+// 目录里的 .sst 只是"物理存在"，Manifest 说了才算"逻辑生效"。
 
 const sstSuffix = ".sst"
 
@@ -28,58 +24,71 @@ func (db *DB) sstPath(num uint64) string {
 	return filepath.Join(db.dir, fmt.Sprintf("%06d%s", num, sstSuffix))
 }
 
-// tableFile 是一个已打开的 SSTable 及其元信息。
-type tableFile struct {
-	num    uint64
-	reader *sstable.Reader
-}
-
-// listSSTs 列出目录里所有 SSTable，按编号从小到大排序。
+// tableCache 按文件编号缓存已打开的 SSTable Reader。
 //
-// 编号越大越新 —— 查找时必须【从新到旧】依次询问，
-// 否则会读到已经被覆盖的旧值。
-func listSSTs(dir string) ([]uint64, error) {
-	entries, err := os.ReadDir(dir)
+// 打开一个 Reader 要读 Footer、读 Index Block、扫描一遍统计边界，
+// 不能每次查询都来一遍。
+type tableCache map[uint64]*sstable.Reader
+
+// table 返回某个文件的 Reader，必要时打开它。
+func (db *DB) table(num uint64) (*sstable.Reader, error) {
+	if r, ok := db.tables[num]; ok {
+		return r, nil
+	}
+	r, err := sstable.Open(db.sstPath(num))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("shale: 打开 SSTable %06d 失败: %w", num, err)
 	}
-	var nums []uint64
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), sstSuffix) {
-			continue
-		}
-		n, err := strconv.ParseUint(strings.TrimSuffix(e.Name(), sstSuffix), 10, 64)
-		if err != nil {
-			continue
-		}
-		nums = append(nums, n)
-	}
-	sort.Slice(nums, func(i, j int) bool { return nums[i] < nums[j] })
-	return nums, nil
+	db.tables[num] = r
+	return r, nil
 }
 
-// openTables 打开目录里所有 SSTable 文件。
-func (db *DB) openTables() error {
-	nums, err := listSSTs(db.dir)
-	if err != nil {
-		return fmt.Errorf("shale: 扫描 SSTable 失败: %w", err)
+// cleanupObsoleteFiles 删除所有【不再被任何存活版本引用】的文件。
+//
+// 这就是引用计数机制的兑现处：
+// compaction 说"这个文件不要了"，但只要还有迭代器持有引用它的旧版本，
+// 文件就必须留着。等到引用归零，才在这里真正删掉。
+//
+// 同时也清理过期的 WAL：编号小于当前日志号的，其数据已经落进 SSTable 了。
+func (db *DB) cleanupObsoleteFiles() error {
+	if db.opts.ReadOnly {
+		return nil
 	}
-	for _, num := range nums {
-		r, err := sstable.Open(db.sstPath(num))
-		if err != nil {
-			return fmt.Errorf("shale: 打开 SSTable %06d 失败: %w", num, err)
+
+	live := db.vs.LiveFiles()
+	curLog := db.walNum
+
+	entries, err := os.ReadDir(db.dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
 		}
-		db.tables = append(db.tables, &tableFile{num: num, reader: r})
-		if num >= db.nextFileNum {
-			db.nextFileNum = num + 1
+		name := e.Name()
+		num, kind, ok := parseFileName(name)
+		if !ok {
+			continue
 		}
-		// 从已落盘的数据里恢复全局序号。
-		//
-		// 这一步不能省：flush 之后对应的 WAL 就被删了，那批记录的 seq
-		// 只剩 SSTable 里还有。少了它，重启后 seq 会归零，
-		// 新写入反而会被当成比老数据更旧 —— 表现为"重启后数据全查不到"。
-		if ms := r.MaxSeq(); ms > db.seq {
-			db.seq = ms
+		keep := true
+		switch kind {
+		case fileSST:
+			keep = live[num]
+		case fileWAL:
+			// 只保留当前正在写的那个日志
+			keep = num >= curLog
+		}
+		if keep {
+			continue
+		}
+		// 从句柄缓存里摘掉再删文件
+		if r, ok := db.tables[num]; ok {
+			r.Close()
+			delete(db.tables, num)
+		}
+		if err := os.Remove(filepath.Join(db.dir, name)); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("shale: 删除废弃文件 %s 失败: %w", name, err)
 		}
 	}
 	return nil
@@ -105,6 +114,34 @@ func cleanupTempFiles(dir string) error {
 	return nil
 }
 
+type fileKind int
+
+const (
+	fileOther fileKind = iota
+	fileSST
+	fileWAL
+)
+
+// parseFileName 从文件名解析出编号和类型。
+func parseFileName(name string) (uint64, fileKind, bool) {
+	var suffix string
+	var kind fileKind
+	switch {
+	case strings.HasSuffix(name, sstSuffix):
+		suffix, kind = sstSuffix, fileSST
+	case strings.HasSuffix(name, walSuffix):
+		suffix, kind = walSuffix, fileWAL
+	default:
+		return 0, fileOther, false
+	}
+	base := strings.TrimSuffix(name, suffix)
+	var num uint64
+	if _, err := fmt.Sscanf(base, "%d", &num); err != nil {
+		return 0, fileOther, false
+	}
+	return num, kind, true
+}
+
 // maybeFlush 在 MemTable 超出阈值时把它刷成 SSTable。
 // 调用方必须已持有写锁。
 func (db *DB) maybeFlush() error {
@@ -122,28 +159,29 @@ func (db *DB) maybeFlush() error {
 //	① 先开一个新 WAL，让后续写入落到新日志里
 //	② 把 MemTable 写成 .tmp 文件并 fsync
 //	③ rename 成正式的 .sst（原子操作）
-//	④ 这时才敢删掉旧 WAL —— 数据已经在 SSTable 里了
+//	④ 把这次变更写进 Manifest —— 到这一步文件才算"生效"
+//	⑤ 清理旧 WAL 和废弃文件
 //
-// 任何一步崩溃都不会丢数据：只要旧 WAL 还在，重启就能重放出来。
+// 任何一步崩溃都不会丢数据：
+// 第 ④ 步之前崩溃，新 .sst 因为没被 Manifest 登记而被当作垃圾清掉，
+// 数据仍在旧 WAL 里；第 ④ 步之后崩溃，数据已经在生效的 SSTable 里了。
 func (db *DB) flushLocked() error {
 	if db.mem.Empty() {
 		return nil
 	}
 
-	oldWALNum := db.walNum
-	fileNum := db.nextFileNum
-	db.nextFileNum++
+	fileNum := db.vs.NextFileNum()
 
 	// ① 新 WAL 先就位。必须在写 SSTable 之前做，
-	//    否则 flush 期间的新写入会落进即将被删除的旧日志里。
+	//    否则 flush 期间的新写入会落进即将被清理的旧日志里。
 	if !db.opts.ReadOnly {
+		newLogNum := db.vs.NextFileNum()
 		if err := db.closeWAL(); err != nil {
 			return err
 		}
-		if err := db.openWAL(db.nextFileNum, 0); err != nil {
+		if err := db.openWAL(newLogNum, 0); err != nil {
 			return err
 		}
-		db.nextFileNum++
 	}
 
 	// ② 写成临时文件
@@ -155,6 +193,7 @@ func (db *DB) flushLocked() error {
 
 	w := sstable.NewWriter(f, db.opts.BlockSize)
 	it := db.mem.NewIterator()
+	var maxSeq uint64
 	for it.SeekToFirst(); it.Valid(); it.Next() {
 		// 原样写出【所有】记录，包括墓碑和被覆盖的旧版本。
 		//
@@ -166,13 +205,16 @@ func (db *DB) flushLocked() error {
 			os.Remove(tmpPath)
 			return fmt.Errorf("shale: 写 SSTable 失败: %w", err)
 		}
+		if s := it.Seq(); s > maxSeq {
+			maxSeq = s
+		}
 	}
 	if err := w.Finish(); err != nil {
 		f.Close()
 		os.Remove(tmpPath)
 		return fmt.Errorf("shale: 写 SSTable 失败: %w", err)
 	}
-	// fsync：必须确认数据真的落盘了，才敢在第 ④ 步删掉 WAL
+	// fsync：必须确认数据真的落盘了，才敢在后面丢弃旧 WAL
 	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmpPath)
@@ -183,62 +225,89 @@ func (db *DB) flushLocked() error {
 		return err
 	}
 
-	entries := w.EntryCount()
-	size := w.FileSize()
+	meta := version.FileMeta{
+		Num:      fileNum,
+		Size:     w.FileSize(),
+		Smallest: append([]byte(nil), w.FirstKey()...),
+		Largest:  append([]byte(nil), w.LastKey()...),
+		MaxSeq:   maxSeq,
+	}
 
-	// ③ 原子地"发布"这个文件
-	finalPath := db.sstPath(fileNum)
-	if err := os.Rename(tmpPath, finalPath); err != nil {
+	// ③ 原子地把文件放到最终位置
+	if err := os.Rename(tmpPath, db.sstPath(fileNum)); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("shale: 发布 SSTable 失败: %w", err)
 	}
 
-	r, err := sstable.Open(finalPath)
-	if err != nil {
-		return fmt.Errorf("shale: 打开新建的 SSTable 失败: %w", err)
-	}
-	db.tables = append(db.tables, &tableFile{num: fileNum, reader: r})
-
-	// ④ 数据已经安全落盘，旧 WAL 可以退休了
-	if oldWALNum != 0 && !db.opts.ReadOnly {
-		if err := os.Remove(db.walPath(oldWALNum)); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("shale: 删除旧 WAL 失败: %w", err)
-		}
+	// ④ 登记到 Manifest —— 到这一步这个文件才算数。
+	//    在此之前崩溃，它就是个没人认领的孤儿文件，会被清理掉。
+	edit := &version.VersionEdit{}
+	edit.AddFile(0, meta) // M7 分层之前，flush 出来的文件都进 L0
+	edit.SetLogNumber(db.walNum)
+	edit.SetLastSequence(db.seq)
+	if err := db.vs.LogAndApply(edit); err != nil {
+		os.Remove(db.sstPath(fileNum))
+		return err
 	}
 
 	db.mem = memtable.New()
 	db.flushCount++
-	db.diskBytesWritten += size
+	db.diskBytesWritten += meta.Size
 
-	_ = entries // 保留变量以便将来记录统计
-	return nil
+	// ⑤ 旧 WAL 和废弃文件现在可以清了
+	return db.cleanupObsoleteFiles()
 }
 
 // getFromTables 按【从新到旧】的顺序在所有 SSTable 里查找。
 //
 // 这个顺序不能反：新文件里的记录（包括墓碑）会覆盖旧文件里的同名 key，
 // 先问旧的就会读到已经被改掉或删掉的值。
-func (db *DB) getFromTables(key []byte, snapshot uint64) ([]byte, ikey.Lookup, error) {
-	for i := len(db.tables) - 1; i >= 0; i-- {
-		v, res, err := db.tables[i].reader.Get(key, snapshot)
-		if err != nil {
-			return nil, ikey.NotFound, err
+//
+// L0 的文件之间 key 范围会重叠（都是 MemTable 直接刷下来的），
+// 所以必须逐个问；编号越大越新，因此要倒着遍历。
+func (db *DB) getFromTables(v *version.Version, key []byte, snapshot uint64) ([]byte, ikey.Lookup, error) {
+	for level := 0; level < version.MaxLevels; level++ {
+		files := v.Files(level)
+		if len(files) == 0 {
+			continue
 		}
-		if res != ikey.NotFound {
-			return v, res, nil // Found 或 Deleted 都是确定的答案，就此打住
+		if level == 0 {
+			for i := len(files) - 1; i >= 0; i-- {
+				val, res, err := db.lookupFile(files[i], key, snapshot)
+				if err != nil || res != ikey.NotFound {
+					return val, res, err
+				}
+			}
+			continue
+		}
+		// L1 及以下层内不重叠，一个 key 最多落在一个文件里。
+		// M7 分层之后这里会换成二分查找。
+		for _, f := range files {
+			val, res, err := db.lookupFile(f, key, snapshot)
+			if err != nil || res != ikey.NotFound {
+				return val, res, err
+			}
 		}
 	}
 	return nil, ikey.NotFound, nil
 }
 
-// closeTables 关闭所有打开的 SSTable。
+func (db *DB) lookupFile(f *version.FileMeta, key []byte, snapshot uint64) ([]byte, ikey.Lookup, error) {
+	r, err := db.table(f.Num)
+	if err != nil {
+		return nil, ikey.NotFound, err
+	}
+	return r.Get(key, snapshot)
+}
+
+// closeTables 关闭所有打开的 SSTable 句柄。
 func (db *DB) closeTables() error {
 	var firstErr error
-	for _, t := range db.tables {
-		if err := t.reader.Close(); err != nil && firstErr == nil {
+	for _, r := range db.tables {
+		if err := r.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
-	db.tables = nil
+	db.tables = make(tableCache)
 	return firstErr
 }
