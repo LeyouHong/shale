@@ -171,22 +171,3 @@ func TestWriteEmptyBatchIsNoop(t *testing.T) {
 		t.Errorf("写 nil Batch 应该直接成功，得到 %v", err)
 	}
 }
-
-// TestM0NotImplementedYet 记录当前里程碑的边界。
-//
-// 这个测试是【会随进度删掉的】—— M1 实现读写路径后就该改成真正的功能测试。
-// 留着它是为了让"哪些还没做"这件事有代码为证，而不是只写在文档里。
-func TestM0NotImplementedYet(t *testing.T) {
-	db, err := Open(t.TempDir(), nil)
-	if err != nil {
-		t.Fatalf("Open 失败: %v", err)
-	}
-	defer db.Close()
-
-	if err := db.Put([]byte("k"), []byte("v")); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("M0 阶段 Put 应返回 ErrNotImplemented，得到 %v", err)
-	}
-	if _, err := db.Get([]byte("k")); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("M0 阶段 Get 应返回 ErrNotImplemented，得到 %v", err)
-	}
-}

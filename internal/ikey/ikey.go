@@ -79,6 +79,42 @@ func (k Kind) String() string {
 	}
 }
 
+// Lookup 是在【某一层】里查找一个 key 的结果。
+//
+// LSM 的读路径是逐层往下找的（MemTable → L0 → L1 → ...），
+// 每一层必须能给出三种不同的回答，否则读路径没法正确终止：
+//
+//	NotFound —— 这一层压根没有这个 key 的记录，【继续去下一层找】
+//	Found    —— 找到了写入记录，返回值，【停止】
+//	Deleted  —— 找到了墓碑，说明它被删了，返回"不存在"，【停止】
+//
+// Deleted 和 NotFound 的区别是整个 LSM 读路径的关键：
+// 墓碑是一个【确定的答案】——它证明这个 key 在更老的层里就算有数据也已经作废，
+// 绝不能因为"这一层没给出值"就继续往下找，否则会把已删除的数据读回来。
+type Lookup int
+
+const (
+	// NotFound 表示这一层没有该 key 的任何记录，应该继续往下层查找。
+	NotFound Lookup = iota
+	// Found 表示找到了有效的值。
+	Found
+	// Deleted 表示找到了墓碑，该 key 已被删除。
+	Deleted
+)
+
+func (l Lookup) String() string {
+	switch l {
+	case NotFound:
+		return "NotFound"
+	case Found:
+		return "Found"
+	case Deleted:
+		return "Deleted"
+	default:
+		return fmt.Sprintf("Lookup(%d)", int(l))
+	}
+}
+
 const (
 	// TrailerSize 是内部 key 尾部的固定长度。
 	TrailerSize = 8

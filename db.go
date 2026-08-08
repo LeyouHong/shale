@@ -5,15 +5,17 @@
 //
 // # 现在能用到哪一步
 //
-// 项目按里程碑推进（见 DESIGN.md 第五节），当前处于 M0：
-// 骨架已就位，内部 key 编码和 Batch 格式已实现并测试，
-// 但读写路径还没接通 —— Put/Get/Delete 目前返回 ErrNotImplemented。
+// 项目按里程碑推进（见 DESIGN.md 第五节），当前处于 M1：
+// Put / Get / Delete / Write 已经可用，但数据【只在内存里】——
+// 还没有 WAL，进程退出就全没了。
 //
 //	M0 ✓ 骨架、Options、错误、内部 key 编码、Batch 格式
-//	M1   跳表 + MemTable（纯内存的 Put/Get/Delete）
-//	M2   WAL + 崩溃恢复
+//	M1 ✓ 跳表 + MemTable（纯内存的读写路径）
+//	M2   WAL + 崩溃恢复          ← 数据开始能活过重启
 //	M3   SSTable 读写
 //	...
+//
+// 还没实现的接口会返回 ErrNotImplemented（NewIterator / Flush / CompactAll）。
 //
 // # 用法
 //
@@ -32,6 +34,7 @@ import (
 	"sync"
 
 	"github.com/leyouhong/shale/internal/ikey"
+	"github.com/leyouhong/shale/internal/memtable"
 )
 
 // DB 是一个打开的数据库实例。
@@ -48,6 +51,9 @@ type DB struct {
 	// 它决定了同一个 key 的多个版本谁新谁旧，是 LSM 的时间轴。
 	// 重启时必须从 Manifest / WAL 恢复出正确的值，否则新写入会被误判为旧版本。
 	seq uint64
+
+	// mem 是当前可写的 MemTable，所有写入先落在这里。
+	mem *memtable.MemTable
 }
 
 // Open 打开（或创建）一个数据库。
@@ -91,6 +97,7 @@ func Open(dir string, opts *Options) (*DB, error) {
 		dir:  abs,
 		opts: opts,
 		seq:  0, // M2 起改为从 Manifest / WAL 恢复
+		mem:  memtable.New(),
 	}
 	return db, nil
 }
@@ -142,8 +149,28 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	if err := validateKey(key); err != nil {
 		return nil, err
 	}
-	// M1 起：MemTable → Immutable MemTable → L0 → L1 → ... 逐层查找
-	return nil, ErrNotImplemented
+
+	// LSM 的读路径：从新到旧逐层查找，谁先给出确定答案就用谁的。
+	//
+	// 当前只有 MemTable 这一层；M2 起会接上 Immutable MemTable，
+	// M3 起接上 L0、L1……但【逐层询问、遇到确定答案就停】这个骨架不会变。
+	//
+	// 用当前 seq 作为快照：能读到此刻为止的所有写入。
+	value, res := db.mem.Get(key, db.seq)
+	switch res {
+	case ikey.Found:
+		// MemTable 里的 value 指向内部存储，必须复制一份再交给调用方，
+		// 否则调用方修改它就会污染数据库。
+		return append([]byte(nil), value...), nil
+	case ikey.Deleted:
+		// 找到墓碑 —— 这是【确定的答案】，绝不能因为"没拿到值"就继续往下层找，
+		// 否则会把已删除的数据读回来。
+		return nil, ErrNotFound
+	default:
+		// 这一层没有任何记录，本该继续往下层找。
+		// M3 之前下面还没有别的层，所以直接判定不存在。
+		return nil, ErrNotFound
+	}
 }
 
 // Write 原子地执行一批操作。
@@ -169,8 +196,35 @@ func (db *DB) Write(b *Batch) error {
 	}); err != nil {
 		return err
 	}
-	// M2 起：分配 seq → 写 WAL → 写 MemTable → 必要时触发 flush
-	return ErrNotImplemented
+
+	// 给整批分配一段连续的序号：第 i 条记录拿到 base+i。
+	//
+	// 「整批共享一个起始 seq」正是原子性在 key 编码层面的落地 ——
+	// 崩溃恢复时只要看 WAL 里这条 batch 记录是否完整，
+	// 就知道这一批是全部生效还是全部没生效。
+	base := db.seq + 1
+	b.SetSeq(base)
+
+	// M2 起：这里要先把 b.Bytes() 追加到 WAL 并（可选）fsync，
+	// 成功之后才允许往 MemTable 写 —— 顺序不能反，
+	// 否则崩溃时会出现"内存里有、日志里没有"的数据。
+
+	var i uint64
+	if err := b.Iterate(func(kind ikey.Kind, key, value []byte) error {
+		db.mem.Add(base+i, kind, key, value)
+		i++
+		return nil
+	}); err != nil {
+		// 走到这里说明 batch 在校验通过之后又出了问题，属于内部错误。
+		// MemTable 可能已经写进去了一部分 —— M2 有了 WAL 之后，
+		// 这种情况会由"WAL 里没有这条记录"来兜底保证原子性。
+		return err
+	}
+	db.seq = base + i - 1
+
+	// M3 起：MemTable 超过 MemTableSize 就冻结、新建一个、触发后台 flush。
+	// 目前没有 SSTable 可刷，只能让它一直涨。
+	return nil
 }
 
 // NewIterator 创建一个遍历全部数据的迭代器。
@@ -212,7 +266,10 @@ func (db *DB) CompactAll() error {
 func (db *DB) Stats() Stats {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	return Stats{Levels: make([]LevelStats, 0)}
+	return Stats{
+		MemTableSize: db.mem.Size(),
+		Levels:       make([]LevelStats, 0),
+	}
 }
 
 // ── 内部辅助 ────────────────────────────────────────────────
