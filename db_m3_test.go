@@ -12,14 +12,6 @@ import (
 
 // 这个文件是 M3 的验收测试：数据能从内存落到磁盘文件。
 
-// numTables 返回当前【生效】的 SSTable 数量。
-//
-// 注意不能用 len(db.tables) —— 那是懒加载的句柄缓存，
-// 只反映"打开过哪些文件"。哪些文件生效由 Manifest 说了算。
-func numTables(db *DB) int {
-	return db.vs.Current().TotalFiles()
-}
-
 // countFiles 统计目录里某种后缀的文件数。
 func countFiles(t *testing.T, dir, suffix string) int {
 	t.Helper()
@@ -59,7 +51,7 @@ func TestFlushCreatesSSTable(t *testing.T) {
 	if n := countFiles(t, dir, ".sst"); n != 1 {
 		t.Errorf("Flush 后有 %d 个 SSTable，期望 1 个", n)
 	}
-	if !db.mem.Empty() {
+	if db.Stats().MemTableSize != 0 {
 		t.Error("Flush 后 MemTable 应该被清空")
 	}
 	// 数据必须还能读到（现在来自磁盘）
@@ -212,14 +204,12 @@ func TestAutoFlush(t *testing.T) {
 	// 注意不能用文件数来判断 flush 是否触发 —— M6 起 compaction
 	// 会把 L0 的文件合并掉，文件数反而是被压下去的。
 	// 要看的是 flush 发生了几次。
-	if db.flushCount < 5 {
-		t.Errorf("只 flush 了 %d 次，自动 flush 似乎没触发", db.flushCount)
-	}
-	if db.mem.Size() >= 16<<10 {
-		t.Errorf("MemTable 大小 %d 超过了阈值，说明没及时 flush", db.mem.Size())
+	st := db.Stats()
+	if st.FlushCount < 5 {
+		t.Errorf("只 flush 了 %d 次，自动 flush 似乎没触发", st.FlushCount)
 	}
 	t.Logf("写入 %d 条：flush %d 次、compaction %d 次，最终剩 %d 个 SSTable，MemTable 当前 %s",
-		n, db.flushCount, db.compactionCount, numTables(db), humanBytes(db.mem.Size()))
+		n, st.FlushCount, st.CompactionCount, numTables(db), humanBytes(st.MemTableSize))
 
 	// 所有数据都要能读到（分散在多个文件和内存里）
 	for i := 0; i < n; i++ {

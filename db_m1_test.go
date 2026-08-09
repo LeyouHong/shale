@@ -20,6 +20,49 @@ func mustOpen(t *testing.T) *DB {
 	return db
 }
 
+// ── 线程安全的测试辅助 ────────────────────────────────────
+//
+// M9 起 flush 和 compaction 在后台 goroutine 里跑，测试再直接读
+// db 的内部字段就是数据竞争了。下面这几个函数统一加锁。
+
+// numTables 返回当前【生效】的 SSTable 数量。
+//
+// 注意不能用 len(db.tables) —— 那是懒加载的句柄缓存，
+// 只反映"打开过哪些文件"。哪些文件生效由 Manifest 说了算。
+func numTables(db *DB) int {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.vs.Current().TotalFiles()
+}
+
+// levelCount 返回某一层的文件数。
+func levelCount(db *DB, level int) int {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.vs.Current().NumFiles(level)
+}
+
+// versionString 返回各层分布的快照描述。
+func versionString(db *DB) string {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.vs.Current().String()
+}
+
+// deepestLevel 返回最深的那个还有文件的层号。
+func deepestLevel(db *DB) int {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	v := db.vs.Current()
+	deepest := 0
+	for level := 0; level < 7; level++ {
+		if v.NumFiles(level) > 0 {
+			deepest = level
+		}
+	}
+	return deepest
+}
+
 // mustGet 断言某个 key 存在且值符合预期。
 func mustGet(t *testing.T, db *DB, key, want string) {
 	t.Helper()

@@ -31,7 +31,14 @@ func (db *DB) sstPath(num uint64) string {
 type tableCache map[uint64]*sstable.Reader
 
 // table 返回某个文件的 Reader，必要时打开它。
+//
+// 这是【读路径上唯一会写共享状态】的地方（懒加载往 map 里塞句柄），
+// 所以要单独用 tablesMu 保护 —— 读路径只持有 db.mu 的读锁，
+// 挡不住多个 Get 同时写这个 map。
 func (db *DB) table(num uint64) (*sstable.Reader, error) {
+	db.tablesMu.Lock()
+	defer db.tablesMu.Unlock()
+
 	if r, ok := db.tables[num]; ok {
 		return r, nil
 	}
@@ -42,6 +49,23 @@ func (db *DB) table(num uint64) (*sstable.Reader, error) {
 	r.SetCache(db.blockCache, num)
 	db.tables[num] = r
 	return r, nil
+}
+
+// dropTable 关闭并移除一个文件的句柄，顺便把它的统计收走。
+func (db *DB) dropTable(num uint64) {
+	db.tablesMu.Lock()
+	defer db.tablesMu.Unlock()
+
+	r, ok := db.tables[num]
+	if !ok {
+		return
+	}
+	// 先把它累积的统计收走，再关掉 —— 否则这些数字就凭空消失了
+	checks, skips := r.FilterStats()
+	db.bloomChecks += checks
+	db.bloomSkips += skips
+	r.Close()
+	delete(db.tables, num)
 }
 
 // cleanupObsoleteFiles 删除所有【不再被任何存活版本引用】的文件。
@@ -57,7 +81,9 @@ func (db *DB) cleanupObsoleteFiles() error {
 	}
 
 	live := db.vs.LiveFiles()
-	curLog := db.walNum
+	// 保留下界是"最老的、数据还没落盘的那个日志"，
+	// 而不是"当前正在写的那个" —— 队列里的 immutable 还指望着它们呢。
+	curLog := db.oldestLiveLogNum()
 
 	entries, err := os.ReadDir(db.dir)
 	if err != nil {
@@ -77,7 +103,6 @@ func (db *DB) cleanupObsoleteFiles() error {
 		case fileSST:
 			keep = live[num]
 		case fileWAL:
-			// 只保留当前正在写的那个日志
 			keep = num >= curLog
 		}
 		if keep {
@@ -86,14 +111,7 @@ func (db *DB) cleanupObsoleteFiles() error {
 		// 从句柄缓存里摘掉再删文件。
 		// 块缓存也要清 —— 否则那些块会一直占着容量，
 		// 而且文件号将来可能被复用，留着会读到错误的数据。
-		if r, ok := db.tables[num]; ok {
-			// 先把它累积的统计收走，再关掉 —— 否则这些数字就凭空消失了
-			checks, skips := r.FilterStats()
-			db.bloomChecks += checks
-			db.bloomSkips += skips
-			r.Close()
-			delete(db.tables, num)
-		}
+		db.dropTable(num)
 		if kind == fileSST {
 			db.blockCache.EvictFile(num)
 		}
@@ -152,49 +170,24 @@ func parseFileName(name string) (uint64, fileKind, bool) {
 	return num, kind, true
 }
 
-// maybeFlush 在 MemTable 超出阈值时把它刷成 SSTable。
-// 调用方必须已持有写锁。
-func (db *DB) maybeFlush() error {
-	if db.mem.Size() < db.opts.MemTableSize {
-		return nil
-	}
-	return db.flushLocked()
-}
-
-// flushLocked 把当前 MemTable 写成一个 SSTable 文件。
-// 调用方必须已持有写锁。
+// writeMemTableToSST 把一个（已冻结的）MemTable 写成 SSTable 并登记进 Manifest。
+// 调用方必须持有 db.mu 写锁。
 //
-// 步骤的顺序是崩溃安全的关键：
+// 步骤顺序决定了崩溃安全性：
 //
-//	① 先开一个新 WAL，让后续写入落到新日志里
-//	② 把 MemTable 写成 .tmp 文件并 fsync
-//	③ rename 成正式的 .sst（原子操作）
-//	④ 把这次变更写进 Manifest —— 到这一步文件才算"生效"
-//	⑤ 清理旧 WAL 和废弃文件
+//	① 写成 .tmp 文件并 fsync
+//	② rename 成正式的 .sst（原子操作）
+//	③ 把这次变更写进 Manifest —— 到这一步文件才算「生效」
 //
-// 任何一步崩溃都不会丢数据：
-// 第 ④ 步之前崩溃，新 .sst 因为没被 Manifest 登记而被当作垃圾清掉，
-// 数据仍在旧 WAL 里；第 ④ 步之后崩溃，数据已经在生效的 SSTable 里了。
-func (db *DB) flushLocked() error {
-	if db.mem.Empty() {
+// 第 ③ 步之前崩溃，新 .sst 因为没被 Manifest 登记而被当作孤儿清掉，
+// 数据仍在 WAL 里；第 ③ 步之后崩溃，数据已经在生效的 SSTable 里了。
+// 两种情况都不丢数据。
+func (db *DB) writeMemTableToSST(mem *memtable.MemTable) error {
+	if mem.Empty() {
 		return nil
 	}
 
 	fileNum := db.vs.NextFileNum()
-
-	// ① 新 WAL 先就位。必须在写 SSTable 之前做，
-	//    否则 flush 期间的新写入会落进即将被清理的旧日志里。
-	if !db.opts.ReadOnly {
-		newLogNum := db.vs.NextFileNum()
-		if err := db.closeWAL(); err != nil {
-			return err
-		}
-		if err := db.openWAL(newLogNum, 0); err != nil {
-			return err
-		}
-	}
-
-	// ② 写成临时文件
 	tmpPath := db.sstPath(fileNum) + ".tmp"
 	f, err := os.Create(tmpPath)
 	if err != nil {
@@ -202,7 +195,7 @@ func (db *DB) flushLocked() error {
 	}
 
 	w := sstable.NewWriterWithBloom(f, db.opts.BlockSize, db.opts.BloomBitsPerKey)
-	it := db.mem.NewIterator()
+	it := mem.NewIterator()
 	var maxSeq uint64
 	for it.SeekToFirst(); it.Valid(); it.Next() {
 		// 原样写出【所有】记录，包括墓碑和被覆盖的旧版本。
@@ -224,7 +217,7 @@ func (db *DB) flushLocked() error {
 		os.Remove(tmpPath)
 		return fmt.Errorf("shale: 写 SSTable 失败: %w", err)
 	}
-	// fsync：必须确认数据真的落盘了，才敢在后面丢弃旧 WAL
+	// fsync：必须确认数据真的落盘了，才敢在后面丢弃对应的 WAL
 	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmpPath)
@@ -243,35 +236,34 @@ func (db *DB) flushLocked() error {
 		MaxSeq:   maxSeq,
 	}
 
-	// ③ 原子地把文件放到最终位置
 	if err := os.Rename(tmpPath, db.sstPath(fileNum)); err != nil {
 		os.Remove(tmpPath)
 		return fmt.Errorf("shale: 发布 SSTable 失败: %w", err)
 	}
 
-	// ④ 登记到 Manifest —— 到这一步这个文件才算数。
-	//    在此之前崩溃，它就是个没人认领的孤儿文件，会被清理掉。
 	edit := &version.VersionEdit{}
-	edit.AddFile(0, meta) // M7 分层之前，flush 出来的文件都进 L0
-	edit.SetLogNumber(db.walNum)
+	edit.AddFile(0, meta) // flush 出来的文件总是进 L0
+	edit.SetLogNumber(db.oldestLiveLogNum())
 	edit.SetLastSequence(db.seq)
 	if err := db.vs.LogAndApply(edit); err != nil {
 		os.Remove(db.sstPath(fileNum))
 		return err
 	}
 
-	db.mem = memtable.New()
 	db.flushCount++
 	db.diskBytesWritten += meta.Size
+	return nil
+}
 
-	// ⑤ 旧 WAL 和废弃文件现在可以清了
-	if err := db.cleanupObsoleteFiles(); err != nil {
-		return err
+// oldestLiveLogNum 返回还不能删除的最小 WAL 编号。
+//
+// 队列里最老的那个 immutable 对应的日志，就是必须保留的下界 ——
+// 它的数据还没落盘，日志是唯一的副本。队列空了就只需保留当前正在写的那个。
+func (db *DB) oldestLiveLogNum() uint64 {
+	if len(db.imm) > 0 {
+		return db.imm[0].logNum
 	}
-
-	// ⑥ 刚往 L0 加了一个文件，可能已经攒够触发合并的数量了。
-	//    同步做 —— M9 会改成后台 goroutine。
-	return db.maybeCompact()
+	return db.frozenLogNum
 }
 
 // getFromTables 按【从新到旧】的顺序在所有 SSTable 里查找。
@@ -324,6 +316,9 @@ func (db *DB) lookupFile(f *version.FileMeta, key []byte, snapshot uint64) ([]by
 
 // closeTables 关闭所有打开的 SSTable 句柄。
 func (db *DB) closeTables() error {
+	db.tablesMu.Lock()
+	defer db.tablesMu.Unlock()
+
 	var firstErr error
 	for _, r := range db.tables {
 		if err := r.Close(); err != nil && firstErr == nil {

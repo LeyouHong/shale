@@ -193,16 +193,15 @@ func TestBlockCacheEvictedOnFileDelete(t *testing.T) {
 	for i := 0; i < 3000; i++ {
 		db.Get([]byte(fmt.Sprintf("k%05d", i))) // 把块读进缓存
 	}
-	cachedBefore := db.blockCache.Len()
+	cachedBefore := db.blockCache.Len() // Cache 自带锁，可直接读
 
 	// 全量 compaction 会重写并删掉所有旧文件
 	if err := db.CompactAll(); err != nil {
 		t.Fatal(err)
 	}
 
-	live := db.vs.LiveFiles()
 	t.Logf("compaction 前缓存了 %d 个块，之后 %d 个（当前生效文件 %d 个）",
-		cachedBefore, db.blockCache.Len(), len(live))
+		cachedBefore, db.blockCache.Len(), numTables(db))
 
 	// 数据必须仍然正确
 	for i := 0; i < 3000; i += 97 {
@@ -269,15 +268,24 @@ func TestFilterSurvivesRestart(t *testing.T) {
 	defer db2.Close()
 
 	// 打开每个文件确认过滤器还在
-	checked := 0
+	db2.mu.RLock()
+	var nums []uint64
 	for level := 0; level < 7; level++ {
 		for _, f := range db2.vs.Current().Files(level) {
-			r, err := db2.table(f.Num)
+			nums = append(nums, f.Num)
+		}
+	}
+	db2.mu.RUnlock()
+
+	checked := 0
+	for level := 0; level < 1; level++ {
+		for _, num := range nums {
+			r, err := db2.table(num)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if !r.HasFilter() {
-				t.Errorf("L%d 文件 %06d 重启后丢了布隆过滤器", level, f.Num)
+				t.Errorf("文件 %06d 重启后丢了布隆过滤器", num)
 			}
 			checked++
 		}

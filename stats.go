@@ -29,8 +29,17 @@ type Stats struct {
 	// LSM 最核心的代价指标，理论上应该在 10~30 之间。
 	DiskBytesWritten int64
 
+	// FlushCount 是已完成的 flush 次数（MemTable → SSTable）。
+	FlushCount int64
+
 	// CompactionCount 是已完成的 compaction 次数。
 	CompactionCount int64
+
+	// WriteStalls 是写入被迫等待后台的次数。
+	//
+	// 这个数字持续增长说明后台跟不上前台 —— 要么调大 MemTable、
+	// 要么放宽 L0 触发阈值，要么就是磁盘不够快。
+	WriteStalls int64
 
 	// BlockCacheHits / BlockCacheMisses 用于计算缓存命中率。
 	BlockCacheHits   int64
@@ -95,7 +104,8 @@ func (s Stats) String() string {
 
 	fmt.Fprintf(&b, "\n写放大: %.2fx (用户写入 %s，磁盘写入 %s)\n",
 		s.WriteAmplification(), humanBytes(s.UserBytesWritten), humanBytes(s.DiskBytesWritten))
-	fmt.Fprintf(&b, "Compaction 次数: %d\n", s.CompactionCount)
+	fmt.Fprintf(&b, "Compaction 次数: %d，写入等待次数: %d\n",
+		s.CompactionCount, s.WriteStalls)
 
 	if s.BlockCacheHits+s.BlockCacheMisses > 0 {
 		fmt.Fprintf(&b, "Block 缓存命中率: %.1f%%\n", s.BlockCacheHitRate()*100)

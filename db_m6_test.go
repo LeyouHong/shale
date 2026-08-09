@@ -35,11 +35,11 @@ func TestCompactionReducesFileCount(t *testing.T) {
 		t.Errorf("L0 有 %d 个文件，不该达到触发阈值 %d —— compaction 没跟上",
 			l0, db.opts.L0CompactionTrigger)
 	}
-	if db.compactionCount == 0 {
+	if st.CompactionCount == 0 {
 		t.Error("应该发生过 compaction")
 	}
 	t.Logf("写入 %d 条：flush %d 次、compaction %d 次，最终 L0=%d 个、L1=%d 个文件",
-		n, db.flushCount, db.compactionCount,
+		n, st.FlushCount, st.CompactionCount,
 		st.Levels[0].NumFiles, levelFiles(st, 1))
 
 	// 数据一条都不能少
@@ -75,7 +75,6 @@ func TestCompactionDropsOldVersions(t *testing.T) {
 		}
 	}
 
-	sizeBefore := totalSize(db.Stats())
 	if err := db.CompactAll(); err != nil {
 		t.Fatal(err)
 	}
@@ -87,11 +86,20 @@ func TestCompactionDropsOldVersions(t *testing.T) {
 		t.Errorf("compaction 后剩 %d 条记录，期望 %d 条（每个 key 只留最新版本）",
 			entries, keys)
 	}
-	if sizeAfter >= sizeBefore {
-		t.Errorf("compaction 后占用 %d 字节，没比之前的 %d 小", sizeAfter, sizeBefore)
+
+	// 断言的是【最终状态】而不是"比之前小"。
+	//
+	// M9 起 compaction 在后台跑，"compaction 之前"这个时间点已经测不准了 ——
+	// 等你去读 Stats，后台可能早就合并完了，前后一对比毫无变化。
+	// 所以改成和"如果一条不删会占多少"比。
+	roughlyAllVersions := int64(keys * rounds * 20) // 每条记录粗估 20 字节
+	if sizeAfter > roughlyAllVersions/10 {
+		t.Errorf("compaction 后仍占 %s，旧版本似乎没被清掉（全留着约需 %s）",
+			humanBytes(sizeAfter), humanBytes(roughlyAllVersions))
 	}
-	t.Logf("%d 个 key 写了 %d 轮（%d 条记录）：compaction 前 %s，之后 %s，剩 %d 条记录",
-		keys, rounds, keys*rounds, humanBytes(sizeBefore), humanBytes(sizeAfter), entries)
+	t.Logf("%d 个 key 写了 %d 轮（%d 条记录）：合并后占 %s、剩 %d 条记录（全留着约需 %s）",
+		keys, rounds, keys*rounds, humanBytes(sizeAfter), entries,
+		humanBytes(roughlyAllVersions))
 
 	// 值必须是最后一轮写的
 	for k := 0; k < keys; k++ {
@@ -171,7 +179,7 @@ func TestTombstoneNotDroppedAboveBottom(t *testing.T) {
 	if err := db.CompactAll(); err != nil {
 		t.Fatal(err)
 	}
-	if db.vs.Current().NumFiles(1) == 0 {
+	if levelCount(db, 1) == 0 {
 		t.Skip("没有形成 L1，跳过")
 	}
 
@@ -343,7 +351,7 @@ func TestWriteAmplification(t *testing.T) {
 	wa := st.WriteAmplification()
 	t.Logf("用户写入 %s，磁盘写入 %s，写放大 %.2fx（flush %d 次、compaction %d 次）",
 		humanBytes(st.UserBytesWritten), humanBytes(st.DiskBytesWritten), wa,
-		db.flushCount, db.compactionCount)
+		st.FlushCount, st.CompactionCount)
 
 	if wa < 1 {
 		t.Errorf("写放大 %.2f 小于 1，统计有问题", wa)

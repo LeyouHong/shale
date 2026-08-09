@@ -5,6 +5,7 @@ import (
 
 	"github.com/leyouhong/shale/internal/ikey"
 	"github.com/leyouhong/shale/internal/iterator"
+	"github.com/leyouhong/shale/internal/memtable"
 	"github.com/leyouhong/shale/internal/version"
 )
 
@@ -21,7 +22,8 @@ type dbIterator struct {
 
 	// v 是创建时抓住的版本。持有它的引用，
 	// 就保证了遍历期间那些 SSTable 文件不会被 compaction 删掉。
-	v *version.Version
+	v  *version.Version
+	db *DB // 只为了 Close 时能拿锁释放引用
 
 	// savedKey 是当前输出的用户 key。
 	// 必须自己存一份 —— inner.Next() 之后它指向的内存就变了，
@@ -39,8 +41,12 @@ type dbIterator struct {
 // 迭代器看到的是【创建那一刻】的快照：之后的写入、flush、compaction
 // 都不会影响它。用完必须 Close，否则它引用的文件无法被回收。
 func (db *DB) NewIterator() (Iterator, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	// 这里必须用【写锁】而不是读锁：v.Ref() 会修改版本的引用计数、
+	// 还可能改动 VersionSet 的存活集合。多个并发 NewIterator 同时
+	// 改这些状态，会让存活集合错乱，进而导致 compaction 误删
+	// 还有人在读的文件（表现为"打开 SSTable 失败：文件不存在"）。
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	if db.closed {
 		return nil, ErrClosed
 	}
@@ -56,7 +62,16 @@ func (db *DB) NewIterator() (Iterator, error) {
 	// MemTable 里写。复制出来就把"边读边写"这个难题整个绕开了。
 	// 代价是一次内存拷贝（MemTable 最多几 MB）。
 	// M9 把跳表改成无锁之后，这里可以换成直接引用。
-	sources = append(sources, snapshotMemTable(db))
+	sources = append(sources, snapshotMemTable(db.mem))
+
+	// 等待刷盘的 immutable 也要算进来 —— 它们的数据还没进 SSTable，
+	// 漏掉的话迭代器会看不到最近写入的一批数据。
+	//
+	// immutable 已经冻结、不会再被写入，本可以直接引用；
+	// 这里仍然复制一份是为了和 mem 走同一条路径，少一处特殊情况。
+	for _, im := range db.imm {
+		sources = append(sources, snapshotMemTable(im.mem))
+	}
 
 	// 再把所有生效的 SSTable 加进来。
 	// 顺序无所谓 —— 排序完全由内部 key 决定，新旧关系编码在 seq 里。
@@ -75,14 +90,15 @@ func (db *DB) NewIterator() (Iterator, error) {
 		inner:    iterator.NewMergingIterator(sources...),
 		snapshot: db.seq,
 		v:        v,
+		db:       db,
 	}
 	return it, nil
 }
 
-// snapshotMemTable 把当前 MemTable 的内容复制成一个只读迭代器。
-func snapshotMemTable(db *DB) iterator.Iterator {
-	entries := make([]iterator.Entry, 0, db.mem.Count())
-	it := db.mem.NewIterator()
+// snapshotMemTable 把一个 MemTable 的内容复制成只读迭代器。
+func snapshotMemTable(m *memtable.MemTable) iterator.Iterator {
+	entries := make([]iterator.Entry, 0, m.Count())
+	it := m.NewIterator()
 	for it.SeekToFirst(); it.Valid(); it.Next() {
 		entries = append(entries, iterator.Entry{
 			Key:   append([]byte(nil), it.Key()...),
@@ -203,7 +219,13 @@ func (i *dbIterator) Close() error {
 	i.closed = true
 	i.valid = false
 	err := i.inner.Close()
+
+	// Unref 会改动版本引用计数和 VersionSet 的存活集合，
+	// 必须在 db.mu 写锁下做 —— 否则和后台 compaction 的
+	// LiveFiles() 撞车，文件可能被误判为可删除。
+	i.db.mu.Lock()
 	i.v.Unref()
+	i.db.mu.Unlock()
 	return err
 }
 

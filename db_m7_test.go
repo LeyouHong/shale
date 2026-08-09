@@ -15,8 +15,15 @@ import (
 // 只有对拍测试才抓得到。所以每个涉及 compaction 的测试都该调它。
 func checkInvariants(t *testing.T, db *DB) {
 	t.Helper()
-	if err := db.vs.Current().CheckInvariants(); err != nil {
-		t.Fatalf("不变量被破坏: %v\n当前版本:\n%s", err, db.vs.Current())
+	// 必须加锁：M9 起 compaction 在后台跑，会并发改动 vs.current
+	db.mu.RLock()
+	v := db.vs.Current()
+	err := v.CheckInvariants()
+	desc := v.String()
+	db.mu.RUnlock()
+
+	if err != nil {
+		t.Fatalf("不变量被破坏: %v\n当前版本:\n%s", err, desc)
 	}
 }
 
@@ -48,7 +55,7 @@ func TestLevelsAreNonOverlapping(t *testing.T) {
 	}
 	checkInvariants(t, db)
 
-	t.Logf("最终层级分布：\n%s", db.vs.Current())
+	t.Logf("最终层级分布：\n%s", versionString(db))
 }
 
 // TestLevelSizesFollowMultiplier 验证各层容量呈 10 倍关系。
@@ -124,17 +131,11 @@ func TestDataSinksToDeeperLevels(t *testing.T) {
 	}
 	checkInvariants(t, db)
 
-	v := db.vs.Current()
-	deepest := 0
-	for level := 0; level < 7; level++ {
-		if v.NumFiles(level) > 0 {
-			deepest = level
-		}
-	}
+	deepest := deepestLevel(db)
 	if deepest < 2 {
 		t.Errorf("数据只到 L%d，应该沉得更深", deepest)
 	}
-	t.Logf("数据最深沉到了 L%d：\n%s", deepest, v)
+	t.Logf("数据最深沉到了 L%d：\n%s", deepest, versionString(db))
 }
 
 // TestCompactPointerRotates 验证轮转指针在推进 ——
@@ -157,6 +158,7 @@ func TestCompactPointerRotates(t *testing.T) {
 		db.Put([]byte(fmt.Sprintf("k%07d", i)), val)
 	}
 
+	db.mu.RLock()
 	moved := false
 	for level := 1; level < 4; level++ {
 		if len(db.compactPointer[level]) > 0 {
@@ -164,6 +166,7 @@ func TestCompactPointerRotates(t *testing.T) {
 			t.Logf("L%d 的轮转指针停在 %q", level, db.compactPointer[level])
 		}
 	}
+	db.mu.RUnlock()
 	if !moved {
 		t.Log("注意：没有任何层发生过 L1+ 的 compaction，轮转指针未被使用")
 	}
@@ -192,7 +195,12 @@ func TestBinarySearchFindsFile(t *testing.T) {
 	}
 	checkInvariants(t, db)
 
+	db.mu.RLock()
 	v := db.vs.Current()
+	v.Ref()
+	db.mu.RUnlock()
+	defer func() { db.mu.Lock(); v.Unref(); db.mu.Unlock() }()
+
 	level := -1
 	for l := 1; l < 7; l++ {
 		if v.NumFiles(l) > 0 {

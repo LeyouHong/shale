@@ -99,11 +99,14 @@ func TestFileMetaRecovered(t *testing.T) {
 	db2, _ := Open(dir, nil)
 	defer db2.Close()
 
+	db2.mu.RLock()
 	files := db2.vs.Current().Files(0)
 	if len(files) != 1 {
+		db2.mu.RUnlock()
 		t.Fatalf("应有 1 个文件，实际 %d 个", len(files))
 	}
-	f := files[0]
+	f := *files[0]
+	db2.mu.RUnlock()
 	if f.Size <= 0 {
 		t.Error("文件大小应该被记录")
 	}
@@ -197,8 +200,10 @@ func TestVersionSnapshotIsolation(t *testing.T) {
 	db.Flush()
 
 	// 抓住当前版本，模拟一个长时间运行的迭代器
+	db.mu.Lock()
 	snap := db.vs.Current()
 	snap.Ref()
+	db.mu.Unlock()
 	filesAtSnapshot := snap.TotalFiles()
 
 	// 再刷两次，产生新版本
@@ -211,18 +216,22 @@ func TestVersionSnapshotIsolation(t *testing.T) {
 		t.Errorf("旧快照看到 %d 个文件，应该始终是 %d 个",
 			snap.TotalFiles(), filesAtSnapshot)
 	}
-	if db.vs.Current().TotalFiles() != 3 {
-		t.Errorf("当前版本应有 3 个文件，实际 %d 个", db.vs.Current().TotalFiles())
+	if n := numTables(db); n != 3 {
+		t.Errorf("当前版本应有 3 个文件，实际 %d 个", n)
 	}
 
 	// 快照持有期间，它引用的文件必须还活着
+	db.mu.RLock()
 	live := db.vs.LiveFiles()
+	db.mu.RUnlock()
 	for _, f := range snap.Files(0) {
 		if !live[f.Num] {
 			t.Errorf("快照引用的文件 %06d 被判定为可删除了", f.Num)
 		}
 	}
+	db.mu.Lock()
 	snap.Unref()
+	db.mu.Unlock()
 }
 
 // TestOldWALsCleanedUp 验证已经落盘的 WAL 会被清理掉。
@@ -236,11 +245,15 @@ func TestOldWALsCleanedUp(t *testing.T) {
 		db.Put([]byte(fmt.Sprintf("k%04d", i)), val)
 	}
 
-	if n := countFiles(t, dir, ".log"); n != 1 {
-		t.Errorf("有 %d 个 WAL 文件，期望 1 个（旧的应该随 flush 被清掉）", n)
+	// M9 起后台刷盘，所以未落盘的 immutable 对应的 WAL 必须保留 ——
+	// 日志数不再总是 1，但上界是"内存中的 MemTable 个数"。
+	n := countFiles(t, dir, ".log")
+	if n > db.opts.MaxMemTables {
+		t.Errorf("有 %d 个 WAL 文件，超过了内存中 MemTable 的上限 %d —— 旧日志没被清理",
+			n, db.opts.MaxMemTables)
 	}
-	t.Logf("写入 1000 条、产生 %d 个 SSTable 之后，仍然只有 1 个 WAL",
-		numTables(db))
+	t.Logf("写入 1000 条、产生 %d 个 SSTable 之后，只剩 %d 个 WAL（上限 %d）",
+		numTables(db), n, db.opts.MaxMemTables)
 }
 
 func TestStatsPerLevel(t *testing.T) {
@@ -260,14 +273,18 @@ func TestStatsPerLevel(t *testing.T) {
 	if st.Levels[0].Level != 0 {
 		t.Error("第一项应该是 L0")
 	}
-	// 各层文件数之和应该等于总文件数。
-	// （M6 起数据会被 compaction 推到 L1，不能只看 L0。）
+	// 只断言 Stats 自身自洽，【不】拿它和另一次 numTables() 去比 ——
+	// M9 起后台在跑，两次独立的观察本来就是两个时间点的快照，
+	// 中间可能刚好完成一次 flush，不一致是正常的。
 	total := 0
 	for _, l := range st.Levels {
 		total += l.NumFiles
+		if l.NumFiles > 0 && l.Size <= 0 {
+			t.Errorf("L%d 有 %d 个文件却报告 0 字节", l.Level, l.NumFiles)
+		}
 	}
-	if total != numTables(db) {
-		t.Errorf("各层文件数之和 = %d，与 Version 里的 %d 不一致", total, numTables(db))
+	if total == 0 {
+		t.Error("写了 500 条数据，应该已经有 SSTable 了")
 	}
 	t.Logf("\n%s", st)
 }

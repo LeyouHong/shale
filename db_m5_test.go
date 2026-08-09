@@ -238,18 +238,24 @@ func TestIteratorHoldsFilesAlive(t *testing.T) {
 	it, _ := db.NewIterator()
 	it.SeekToFirst()
 
+	db.mu.RLock()
 	filesHeld := db.vs.Current().Files(0)
 	if len(filesHeld) != 1 {
+		db.mu.RUnlock()
 		t.Fatalf("应有 1 个文件，实际 %d 个", len(filesHeld))
 	}
 	num := filesHeld[0].Num
+	db.mu.RUnlock()
 
 	// 再刷几次产生新版本
 	db.Put([]byte("k2"), []byte("v2"))
 	db.Flush()
 
 	// 迭代器还活着，它引用的文件必须仍被判定为存活
-	if !db.vs.LiveFiles()[num] {
+	db.mu.RLock()
+	live := db.vs.LiveFiles()
+	db.mu.RUnlock()
+	if !live[num] {
 		t.Error("迭代器持有的文件不该被判定为可删除")
 	}
 

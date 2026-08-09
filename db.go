@@ -5,11 +5,9 @@
 //
 // # 现在能用到哪一步
 //
-// 项目按里程碑推进（见 DESIGN.md 第五节），当前处于 M8：
-// 读、写、扫描、崩溃恢复、分层 compaction、布隆过滤器、块缓存都已具备。
-//
-// 还差 M9 的并发优化：目前写入串行、flush 和 compaction 都是同步执行的
-// （会阻塞调用它的那次写入）。
+// 项目按里程碑推进（见 DESIGN.md 第五节），M0~M9 已全部完成：
+// 读、写、扫描、崩溃恢复、分层 compaction、布隆过滤器、块缓存，
+// 以及后台执行的 flush / compaction。
 //
 //	M0 ✓ 骨架、Options、错误、内部 key 编码、Batch 格式
 //	M1 ✓ 跳表 + MemTable（纯内存的读写路径）
@@ -20,7 +18,17 @@
 //	M6 ✓ Compaction（简单全量合并）
 //	M7 ✓ Leveled Compaction + 分层
 //	M8 ✓ 布隆过滤器 + Block Cache
-//	M9   并发 + 压测
+//	M9 ✓ 后台 flush / compaction + 并发压测
+//
+// # 并发模型
+//
+//	db.mu       保护 DB 的绝大部分状态（MemTable、版本、WAL……）
+//	db.tablesMu 单独保护文件句柄缓存 —— 它在【读路径上会被写】（懒加载），
+//	            读路径只持有 db.mu 的读锁，挡不住并发写这个 map
+//	db.bg.mu    保护后台任务的调度状态
+//
+// 锁顺序固定为 db.mu → tablesMu / bg.mu，绝不颠倒。
+// 反过来嵌套会死锁 —— 这个坑在 M9 真踩到过一次。
 //
 // 还没实现的接口会返回 ErrNotImplemented（NewIterator / Flush / CompactAll）。
 //
@@ -47,6 +55,8 @@ import (
 	"github.com/leyouhong/shale/internal/wal"
 )
 
+// 后台任务相关的类型定义见 background.go。
+
 // DB 是一个打开的数据库实例。
 //
 // 所有方法都是并发安全的（M9 之前靠一把大锁保证，之后再优化）。
@@ -65,6 +75,20 @@ type DB struct {
 	// mem 是当前可写的 MemTable，所有写入先落在这里。
 	mem *memtable.MemTable
 
+	// imm 是已冻结、等待后台刷盘的 MemTable 队列（越靠前越老）。
+	//
+	// 冻结之后就不再写入，所以后台读它是安全的 ——
+	// 这正是"前台不用等落盘"的实现基础。查询时要按【从新到旧】
+	// 的顺序看：mem → imm 倒序 → SSTable。
+	imm []*immTable
+
+	// frozenLogNum 是当前 mem 对应的 WAL 编号。
+	// 冻结时它会被移交给 immTable，用于判断哪些日志可以删。
+	frozenLogNum uint64
+
+	// bg 管理后台 flush / compaction 的调度。
+	bg *bgState
+
 	// WAL：写入 MemTable 之前先把 batch 追加到这里，用于崩溃恢复。
 	walFile *os.File
 	wal     *wal.Writer
@@ -82,7 +106,14 @@ type DB struct {
 	vs *version.VersionSet
 
 	// tables 缓存已打开的 SSTable 句柄，避免每次查询都重新打开文件。
-	tables tableCache
+	//
+	// 它有自己的锁：这个 map 在【读路径上会被写】（懒加载打开文件），
+	// 而读路径只持有 db.mu 的读锁 —— 多个并发 Get 会同时写这个 map。
+	// 用 db.mu 的写锁保护它则会让所有读串行化，得不偿失。
+	//
+	// 锁顺序：db.mu → tablesMu，不可颠倒。
+	tablesMu sync.Mutex
+	tables   tableCache
 
 	// blockCache 在所有 SSTable 之间共享，缓存读过的数据块。
 	blockCache *cache.Cache
@@ -99,6 +130,7 @@ type DB struct {
 	bloomChecks      int64
 	bloomSkips       int64
 	flushCount       int64
+	stallCount       int64
 	compactionCount  int64
 	droppedEntries   int64
 	diskBytesWritten int64
@@ -149,6 +181,7 @@ func Open(dir string, opts *Options) (*DB, error) {
 		tables:     make(tableCache),
 		blockCache: cache.New(opts.BlockCacheSize),
 		vs:         version.NewVersionSet(abs),
+		bg:         newBGState(),
 	}
 
 	// ① 先从 Manifest 恢复元数据：有哪些文件、seq 到哪了、下一个文件号是几。
@@ -186,6 +219,10 @@ func Open(dir string, opts *Options) (*DB, error) {
 			return nil, err
 		}
 	}
+	db.frozenLogNum = db.walNum
+
+	// 重放出来的数据可能已经够触发一次 compaction 了，交给后台去处理
+	db.maybeScheduleBG()
 	return db, nil
 }
 
@@ -201,13 +238,19 @@ func (db *DB) RecoverWarning() error { return db.recoverWarning }
 // Close 关闭数据库，释放所有资源。
 // 关闭后再调用任何方法都会返回 ErrClosed。重复 Close 是安全的。
 func (db *DB) Close() error {
+	// 先通知后台别再接新活，然后放开锁等它干完手头的 ——
+	// 拿着锁等会死锁，因为后台干活也要这把锁。
+	db.bg.mu.Lock()
+	db.bg.closing = true
+	db.bg.mu.Unlock()
+	db.waitForBackgroundIdle()
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.closed {
 		return nil
 	}
 	db.closed = true
-	// M9 起：这里还要等后台 flush / compaction 的 goroutine 退出
 	err := db.closeWAL()
 	if cerr := db.closeTables(); err == nil {
 		err = cerr
@@ -270,7 +313,17 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		return append([]byte(nil), value...), nil
 	}
 
-	// ② 再逐个问已落盘的 SSTable
+	// ② 再问等待刷盘的 immutable，【从新到旧】—— 后加入队列的更新
+	for i := len(db.imm) - 1; i >= 0; i-- {
+		if value, res := db.imm[i].mem.Get(key, snapshot); res != ikey.NotFound {
+			if res == ikey.Deleted {
+				return nil, ErrNotFound
+			}
+			return append([]byte(nil), value...), nil
+		}
+	}
+
+	// ③ 最后逐个问已落盘的 SSTable
 	value, res, err := db.getFromTables(db.vs.Current(), key, snapshot)
 	if err != nil {
 		return nil, err
@@ -308,6 +361,11 @@ func (db *DB) Write(b *Batch) error {
 		}
 		return nil
 	}); err != nil {
+		return err
+	}
+
+	// 先确保有地方可写：必要时冻结当前 MemTable、或者等后台腾出位置。
+	if err := db.makeRoomForWrite(); err != nil {
 		return err
 	}
 
@@ -352,12 +410,9 @@ func (db *DB) Write(b *Batch) error {
 	db.userBytesWritten += int64(b.Size())
 	db.diskBytesWritten += int64(b.Size())
 
-	// MemTable 写满了就落盘，腾出内存、同时让 WAL 得以被截断。
-	//
-	// 这里是【同步】刷的：写入会被阻塞到 flush 完成。
-	// 真实引擎会交给后台 goroutine 并新建一个 MemTable 立刻接收写入，
-	// 本项目留到 M9 —— 先把正确性做对。
-	return db.maybeFlush()
+	// MemTable 写满时不在这里原地刷 —— 只是冻结换新，
+	// 真正的落盘交给后台。前台最多在"后台严重跟不上"时才需要等。
+	return db.makeRoomForWrite()
 }
 
 // Flush 强制把当前 MemTable 刷成 SSTable。主要用于测试和调试。
@@ -370,7 +425,16 @@ func (db *DB) Flush() error {
 	if db.opts.ReadOnly {
 		return ErrReadOnly
 	}
-	return db.flushLocked()
+	if err := db.freezeMemTable(); err != nil {
+		return err
+	}
+	// 同步把队列里的都刷完 —— Flush 的语义就是"返回时数据已经落盘"
+	for len(db.imm) > 0 {
+		if err := db.flushOneImmutable(); err != nil {
+			return err
+		}
+	}
+	return db.maybeCompact()
 }
 
 // CompactAll 手动触发一次全量 compaction，把所有层合并干净。
@@ -384,9 +448,14 @@ func (db *DB) CompactAll() error {
 	if db.opts.ReadOnly {
 		return ErrReadOnly
 	}
-	// 先把内存里的刷下去，再合并 —— 否则 MemTable 里的数据参与不进来
-	if err := db.flushLocked(); err != nil {
+	// 先把内存里的（含等待刷盘的）都落下去，否则它们参与不进合并
+	if err := db.freezeMemTable(); err != nil {
 		return err
+	}
+	for len(db.imm) > 0 {
+		if err := db.flushOneImmutable(); err != nil {
+			return err
+		}
 	}
 	return db.compactAllLocked()
 }
@@ -399,15 +468,20 @@ func (db *DB) Stats() Stats {
 		MemTableSize:     db.mem.Size(),
 		UserBytesWritten: db.userBytesWritten,
 		DiskBytesWritten: db.diskBytesWritten,
+		FlushCount:       db.flushCount,
 		CompactionCount:  db.compactionCount,
 	}
+	st.ImmutableCount = len(db.imm)
+	st.WriteStalls = db.stallCount
 	st.BlockCacheHits, st.BlockCacheMisses = db.blockCache.Stats()
 	st.BloomFilterChecks, st.BloomFilterSkips = db.bloomChecks, db.bloomSkips
+	db.tablesMu.Lock()
 	for _, r := range db.tables {
 		checks, skips := r.FilterStats()
 		st.BloomFilterChecks += checks
 		st.BloomFilterSkips += skips
 	}
+	db.tablesMu.Unlock()
 	v := db.vs.Current()
 	for level := 0; level < version.MaxLevels; level++ {
 		if v.NumFiles(level) == 0 && level > 0 {
