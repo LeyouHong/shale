@@ -350,7 +350,7 @@ func (o *compactionOutput) open() error {
 		return fmt.Errorf("shale: compaction 创建文件失败: %w", err)
 	}
 	o.file = f
-	o.writer = sstable.NewWriter(f, o.db.opts.BlockSize)
+	o.writer = sstable.NewWriterWithBloom(f, o.db.opts.BlockSize, o.db.opts.BloomBitsPerKey)
 	o.maxSeq = 0
 	return nil
 }

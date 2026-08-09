@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/leyouhong/shale/internal/bloom"
 	"github.com/leyouhong/shale/internal/ikey"
 )
 
@@ -87,16 +88,29 @@ type Writer struct {
 	lastKey  []byte
 	firstKey []byte
 
+	// bloomBits > 0 时收集用户 key，Finish 时构建过滤器。
+	//
+	// 收的是【用户 key】而不是内部 key：查询时手上只有用户 key，
+	// 不知道它对应哪个 seq，所以过滤器也必须按用户 key 建。
+	bloomBits  int
+	filterKeys [][]byte
+
 	finished bool
 	err      error
 }
 
 // NewWriter 创建一个 Writer。blockSize <= 0 时用默认值。
 func NewWriter(w io.Writer, blockSize int) *Writer {
+	return NewWriterWithBloom(w, blockSize, 0)
+}
+
+// NewWriterWithBloom 创建一个会附带布隆过滤器的 Writer。
+// bloomBits 是每个 key 分配的比特数，0 表示不建过滤器。
+func NewWriterWithBloom(w io.Writer, blockSize, bloomBits int) *Writer {
 	if blockSize <= 0 {
 		blockSize = DefaultBlockSize
 	}
-	return &Writer{w: w, blockSize: blockSize}
+	return &Writer{w: w, blockSize: blockSize, bloomBits: bloomBits}
 }
 
 // Add 追加一条记录。key 必须是内部 key，且【严格递增】。
@@ -117,6 +131,14 @@ func (w *Writer) Add(key, value []byte) error {
 
 	if w.entries == 0 {
 		w.firstKey = append(w.firstKey[:0], key...)
+	}
+	if w.bloomBits > 0 {
+		// 同一个用户 key 的多个版本会重复加入，无害 ——
+		// 重复只是把同样的位再置一遍。
+		uk := ikey.UserKey(key)
+		if n := len(w.filterKeys); n == 0 || !bytesEqual(w.filterKeys[n-1], uk) {
+			w.filterKeys = append(w.filterKeys, append([]byte(nil), uk...))
+		}
 	}
 	w.data.add(key, value)
 	w.lastKey = append(w.lastKey[:0], key...)
@@ -182,6 +204,20 @@ func (w *Writer) Finish() error {
 		return err
 	}
 
+	// 先写过滤器块。它和数据块一样是内容块，位置记在 Footer 里。
+	var filterHandle blockHandle
+	if w.bloomBits > 0 && len(w.filterKeys) > 0 {
+		f := bloom.New(w.bloomBits, w.filterKeys)
+		var fb blockBuilder
+		fb.buf = append(fb.buf, f.Encode()...)
+		fb.entries = 1 // 让 finish 认为它非空
+		h, err := w.writeBlock(&fb)
+		if err != nil {
+			return err
+		}
+		filterHandle = h
+	}
+
 	indexHandle, err := w.writeBlock(&w.index)
 	if err != nil {
 		return err
@@ -192,8 +228,8 @@ func (w *Writer) Finish() error {
 	var footer [footerSize]byte
 	binary.LittleEndian.PutUint64(footer[0:8], indexHandle.offset)
 	binary.LittleEndian.PutUint64(footer[8:16], indexHandle.size)
-	binary.LittleEndian.PutUint64(footer[16:24], 0) // filter offset，M8 才用
-	binary.LittleEndian.PutUint64(footer[24:32], 0) // filter size
+	binary.LittleEndian.PutUint64(footer[16:24], filterHandle.offset)
+	binary.LittleEndian.PutUint64(footer[24:32], filterHandle.size)
 	binary.LittleEndian.PutUint64(footer[32:40], magicNumber)
 
 	if _, err := w.w.Write(footer[:]); err != nil {
@@ -216,3 +252,16 @@ func (w *Writer) FirstKey() []byte { return w.firstKey }
 
 // LastKey 返回文件里最大的内部 key。
 func (w *Writer) LastKey() []byte { return w.lastKey }
+
+// bytesEqual 是 bytes.Equal 的等价实现，避免为一个函数引入整个包。
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

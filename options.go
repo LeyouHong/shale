@@ -58,7 +58,7 @@ type Options struct {
 	BlockSize int
 
 	// BloomBitsPerKey 是布隆过滤器给每个 key 分配几个 bit。默认 10（假阳性率约 0.8%）。
-	// 设为 0 表示【关闭】布隆过滤器 —— 可以用来对比测试它到底省了多少次磁盘读。
+	// 设为 -1 表示【关闭】布隆过滤器 —— 可以用来对比测试它到底省了多少次磁盘读。
 	BloomBitsPerKey int
 
 	// ── 缓存与持久化 ──────────────────────────────────────
@@ -128,13 +128,17 @@ func (o *Options) fillDefaults() {
 	if o.BlockSize <= 0 {
 		o.BlockSize = DefaultBlockSize
 	}
-	// BloomBitsPerKey 和 BlockCacheSize 的 0 是有意义的（表示关闭），
-	// 所以用负数判断"没设置"。
-	if o.BloomBitsPerKey < 0 {
+	// 这两项的"关闭"用负数表示，所以 0（零值）走默认值这条路。
+	// 反过来设计的话，忘记配置就等于关掉了它们 —— 那是最不该发生的默认行为。
+	if o.BloomBitsPerKey == 0 {
 		o.BloomBitsPerKey = DefaultBloomBitsPerKey
+	} else if o.BloomBitsPerKey < 0 {
+		o.BloomBitsPerKey = 0 // 显式关闭
 	}
-	if o.BlockCacheSize < 0 {
+	if o.BlockCacheSize == 0 {
 		o.BlockCacheSize = DefaultBlockCacheSize
+	} else if o.BlockCacheSize < 0 {
+		o.BlockCacheSize = 0 // 显式关闭
 	}
 }
 

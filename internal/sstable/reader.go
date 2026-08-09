@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync/atomic"
 
+	"github.com/leyouhong/shale/internal/bloom"
+	"github.com/leyouhong/shale/internal/cache"
 	"github.com/leyouhong/shale/internal/ikey"
 )
 
@@ -27,6 +30,25 @@ type Reader struct {
 	lastKey  []byte
 	entries  int
 	maxSeq   uint64
+
+	// filter 是布隆过滤器，nil 表示这个文件没建过滤器
+	// （老文件、或者配置里关掉了）。没有就退化成每次都真读，结果依然正确。
+	filter *bloom.Filter
+
+	// blockCache 由 DB 传入并在所有文件间共享，可以为 nil。
+	blockCache *cache.Cache
+	fileNum    uint64
+
+	// 统计。用原子操作是因为 Reader 是并发安全的 ——
+	// 多个 goroutine 会同时查同一个文件。
+	filterChecks atomic.Int64
+	filterSkips  atomic.Int64
+}
+
+// SetCache 让这个 Reader 使用共享的块缓存。fileNum 用于构造缓存 key。
+func (r *Reader) SetCache(c *cache.Cache, fileNum uint64) {
+	r.blockCache = c
+	r.fileNum = fileNum
 }
 
 // Open 打开一个 SSTable 文件。
@@ -82,6 +104,23 @@ func NewReader(r io.ReaderAt, size int64) (*Reader, error) {
 	}
 
 	sr := &Reader{r: r, size: size, index: index}
+
+	// 读布隆过滤器（如果这个文件有的话）。
+	// 它常驻内存 —— 10 bit/key 的配置下，100 万个 key 才 1.2MB。
+	filterOff := binary.LittleEndian.Uint64(footer[16:24])
+	filterSize := binary.LittleEndian.Uint64(footer[24:32])
+	if filterSize > 0 && filterOff+filterSize <= uint64(size) {
+		raw := make([]byte, filterSize)
+		if _, err := r.ReadAt(raw, int64(filterOff)); err != nil {
+			return nil, fmt.Errorf("sstable: 读 Filter Block 失败: %w", err)
+		}
+		fb, err := decodeBlock(raw)
+		if err != nil {
+			return nil, err
+		}
+		sr.filter = bloom.Decode(fb.data)
+	}
+
 	if err := sr.scanBounds(); err != nil {
 		return nil, err
 	}
@@ -121,6 +160,19 @@ func (r *Reader) scanBounds() error {
 //	ikey.Found    —— 找到了值
 //	ikey.Deleted  —— 找到了墓碑，该 key 已删除，停止查找
 func (r *Reader) Get(userKey []byte, snapshot uint64) ([]byte, ikey.Lookup, error) {
+	// ⓪ 先问布隆过滤器 —— 它说"没有"就是 100% 确定没有，
+	//    可以【完全不碰磁盘】直接返回。
+	//
+	//    这是整个读路径上最划算的一步：查一个不存在的 key 时，
+	//    每一层都能在这里被挡掉，一次磁盘 IO 都不会发生。
+	if r.filter != nil {
+		r.filterChecks.Add(1)
+		if !r.filter.MayContain(userKey) {
+			r.filterSkips.Add(1)
+			return nil, ikey.NotFound, nil
+		}
+	}
+
 	var stack [72]byte
 	seek := ikey.MakeSeekKey(stack[:0], userKey, snapshot)
 
@@ -177,18 +229,29 @@ func decodeHandle(v []byte) (blockHandle, bool) {
 	return blockHandle{offset: off, size: size}, true
 }
 
-// readBlock 从磁盘读出一个块并校验。
+// readBlock 从磁盘读出一个块并校验，命中缓存时直接返回。
 //
-// M8 会在这里插入 Block Cache —— 目前每次都真读磁盘。
+// 缓存里存的是【校验过的块内容】，命中时连 CRC 都不用再算一遍。
 func (r *Reader) readBlock(h blockHandle) (block, error) {
 	if h.offset+h.size > uint64(r.size) {
 		return block{}, fmt.Errorf("%w: 块位置越界", ErrCorrupt)
 	}
+
+	ck := cache.Key{FileNum: r.fileNum, Offset: h.offset}
+	if data, ok := r.blockCache.Get(ck); ok {
+		return block{data: data}, nil
+	}
+
 	raw := make([]byte, h.size)
 	if _, err := r.r.ReadAt(raw, int64(h.offset)); err != nil {
 		return block{}, fmt.Errorf("sstable: 读块失败: %w", err)
 	}
-	return decodeBlock(raw)
+	b, err := decodeBlock(raw)
+	if err != nil {
+		return block{}, err
+	}
+	r.blockCache.Put(ck, b.data)
+	return b, nil
 }
 
 // FirstKey 返回文件里最小的内部 key（文件为空时返回 nil）。
@@ -213,6 +276,17 @@ func (r *Reader) MaxSeq() uint64 { return r.maxSeq }
 
 // Size 返回文件字节数。
 func (r *Reader) Size() int64 { return r.size }
+
+// HasFilter 返回这个文件是否带布隆过滤器。
+func (r *Reader) HasFilter() bool { return r.filter != nil }
+
+// FilterStats 返回过滤器被查询的次数、以及其中成功挡下的次数。
+//
+// 挡下比例越高，说明省掉的磁盘读越多。
+// 专门查一批不存在的 key 时，这个比例应该接近 1。
+func (r *Reader) FilterStats() (checks, skips int64) {
+	return r.filterChecks.Load(), r.filterSkips.Load()
+}
 
 // Close 关闭底层文件（如果是通过 Open 打开的）。
 func (r *Reader) Close() error {

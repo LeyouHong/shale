@@ -5,12 +5,11 @@
 //
 // # 现在能用到哪一步
 //
-// 项目按里程碑推进（见 DESIGN.md 第五节），当前处于 M7：
-// 读、写、扫描、崩溃恢复、分层 compaction 都已具备，
-// 是一个结构完整的 LSM 引擎了。
+// 项目按里程碑推进（见 DESIGN.md 第五节），当前处于 M8：
+// 读、写、扫描、崩溃恢复、分层 compaction、布隆过滤器、块缓存都已具备。
 //
-// 还差两块性能件：布隆过滤器（M8，让"查不存在的 key"不必读盘）
-// 和并发优化（M9，目前写入串行、compaction 同步执行）。
+// 还差 M9 的并发优化：目前写入串行、flush 和 compaction 都是同步执行的
+// （会阻塞调用它的那次写入）。
 //
 //	M0 ✓ 骨架、Options、错误、内部 key 编码、Batch 格式
 //	M1 ✓ 跳表 + MemTable（纯内存的读写路径）
@@ -20,7 +19,7 @@
 //	M5 ✓ Iterator + 多路归并
 //	M6 ✓ Compaction（简单全量合并）
 //	M7 ✓ Leveled Compaction + 分层
-//	M8   布隆过滤器 + Block Cache
+//	M8 ✓ 布隆过滤器 + Block Cache
 //	M9   并发 + 压测
 //
 // 还没实现的接口会返回 ErrNotImplemented（NewIterator / Flush / CompactAll）。
@@ -41,6 +40,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/leyouhong/shale/internal/cache"
 	"github.com/leyouhong/shale/internal/ikey"
 	"github.com/leyouhong/shale/internal/memtable"
 	"github.com/leyouhong/shale/internal/version"
@@ -84,11 +84,20 @@ type DB struct {
 	// tables 缓存已打开的 SSTable 句柄，避免每次查询都重新打开文件。
 	tables tableCache
 
+	// blockCache 在所有 SSTable 之间共享，缓存读过的数据块。
+	blockCache *cache.Cache
+
 	// compactPointer 记录每层上次 compaction 停在哪个 key，用于轮转。
 	// 不轮转的话同一段 key 会被反复重写，后面的数据永远沉不下去。
 	compactPointer [version.MaxLevels][]byte
 
 	// 统计
+	//
+	// bloomChecks/bloomSkips 是【已关闭文件】累积下来的计数。
+	// 不能只统计 db.tables 里还开着的 Reader —— compaction 会删掉旧文件，
+	// 它们的计数会随之消失，Stats 就会莫名其妙地倒退。
+	bloomChecks      int64
+	bloomSkips       int64
 	flushCount       int64
 	compactionCount  int64
 	droppedEntries   int64
@@ -134,11 +143,12 @@ func Open(dir string, opts *Options) (*DB, error) {
 	}
 
 	db := &DB{
-		dir:    abs,
-		opts:   opts,
-		mem:    memtable.New(),
-		tables: make(tableCache),
-		vs:     version.NewVersionSet(abs),
+		dir:        abs,
+		opts:       opts,
+		mem:        memtable.New(),
+		tables:     make(tableCache),
+		blockCache: cache.New(opts.BlockCacheSize),
+		vs:         version.NewVersionSet(abs),
 	}
 
 	// ① 先从 Manifest 恢复元数据：有哪些文件、seq 到哪了、下一个文件号是几。
@@ -390,6 +400,13 @@ func (db *DB) Stats() Stats {
 		UserBytesWritten: db.userBytesWritten,
 		DiskBytesWritten: db.diskBytesWritten,
 		CompactionCount:  db.compactionCount,
+	}
+	st.BlockCacheHits, st.BlockCacheMisses = db.blockCache.Stats()
+	st.BloomFilterChecks, st.BloomFilterSkips = db.bloomChecks, db.bloomSkips
+	for _, r := range db.tables {
+		checks, skips := r.FilterStats()
+		st.BloomFilterChecks += checks
+		st.BloomFilterSkips += skips
 	}
 	v := db.vs.Current()
 	for level := 0; level < version.MaxLevels; level++ {

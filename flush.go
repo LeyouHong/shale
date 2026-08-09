@@ -39,6 +39,7 @@ func (db *DB) table(num uint64) (*sstable.Reader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("shale: 打开 SSTable %06d 失败: %w", num, err)
 	}
+	r.SetCache(db.blockCache, num)
 	db.tables[num] = r
 	return r, nil
 }
@@ -82,10 +83,19 @@ func (db *DB) cleanupObsoleteFiles() error {
 		if keep {
 			continue
 		}
-		// 从句柄缓存里摘掉再删文件
+		// 从句柄缓存里摘掉再删文件。
+		// 块缓存也要清 —— 否则那些块会一直占着容量，
+		// 而且文件号将来可能被复用，留着会读到错误的数据。
 		if r, ok := db.tables[num]; ok {
+			// 先把它累积的统计收走，再关掉 —— 否则这些数字就凭空消失了
+			checks, skips := r.FilterStats()
+			db.bloomChecks += checks
+			db.bloomSkips += skips
 			r.Close()
 			delete(db.tables, num)
+		}
+		if kind == fileSST {
+			db.blockCache.EvictFile(num)
 		}
 		if err := os.Remove(filepath.Join(db.dir, name)); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("shale: 删除废弃文件 %s 失败: %w", name, err)
@@ -191,7 +201,7 @@ func (db *DB) flushLocked() error {
 		return fmt.Errorf("shale: 创建 SSTable 失败: %w", err)
 	}
 
-	w := sstable.NewWriter(f, db.opts.BlockSize)
+	w := sstable.NewWriterWithBloom(f, db.opts.BlockSize, db.opts.BloomBitsPerKey)
 	it := db.mem.NewIterator()
 	var maxSeq uint64
 	for it.SeekToFirst(); it.Valid(); it.Next() {
