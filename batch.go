@@ -114,6 +114,22 @@ func (b *Batch) Load(data []byte) error {
 	return nil
 }
 
+// Append 把另一个 Batch 的记录全部追加到自己后面。
+//
+// group commit 靠它把多个并发写入者的 batch 合成一个 ——
+// 而这几乎是零成本的：记录区就是一段连续字节，直接拼接即可，
+// 只需要把 count 加起来。seq 由 DB 在真正写入前统一分配。
+//
+// 这正是"Batch 的二进制形式就是 WAL 记录"这个设计的红利：
+// 合并之后依然是一条合法的 WAL 记录，不需要任何转换。
+func (b *Batch) Append(other *Batch) {
+	if other == nil || other.Empty() {
+		return
+	}
+	b.setCount(b.Count() + other.Count())
+	b.buf = append(b.buf, other.buf[batchHeaderSize:]...)
+}
+
 // Iterate 按顺序遍历 Batch 里的每条记录。
 //
 // fn 返回非 nil 时立刻中止并把该错误返回。

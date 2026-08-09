@@ -463,10 +463,12 @@ compaction 从不修改现有文件，旧读者读的还是旧文件，内容一
 按价值排序：
 
 ```
-   1. group commit          多个并发写攒一批只 fsync 一次
-                            —— 当前 SyncWAL=true 时只有 465 ops/s，这是最大的短板
-   2. 无锁跳表               去掉迭代器复制 MemTable 的开销
-   3. SSTable 块内前缀压缩    key 有大量公共前缀时能省不少空间
-   4. 压缩算法（LZ4/ZSTD）    冷数据层用重压缩
-   5. Partitioned Index      单文件索引块过大时分片加载
+   ✓ group commit          已在 M10 完成：32 并发下提速 16.9 倍，
+                           fsync 次数降到 1/16
+
+   1. 无锁跳表               去掉迭代器复制 MemTable 的开销；
+                           还能让 group commit 的 MemTable 插入也移到锁外
+   2. SSTable 块内前缀压缩    key 有大量公共前缀时能省不少空间
+   3. 压缩算法（LZ4/ZSTD）    冷数据层用重压缩
+   4. Partitioned Index      单文件索引块过大时分片加载
 ```

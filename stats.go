@@ -35,6 +35,16 @@ type Stats struct {
 	// CompactionCount 是已完成的 compaction 次数。
 	CompactionCount int64
 
+	// GroupCommits 是发生过多少批组提交，
+	// GroupedWrites 是这些批次总共代写了多少个写入者，
+	// MaxGroupSize 是单批合并过的最多人数。
+	//
+	// GroupedWrites / GroupCommits 就是【平均每批合并了几个人】——
+	// 这个值越大，fsync 被摊薄得越厉害。单线程写入时它恒为 1。
+	GroupCommits  int64
+	GroupedWrites int64
+	MaxGroupSize  int64
+
 	// WriteStalls 是写入被迫等待后台的次数。
 	//
 	// 这个数字持续增长说明后台跟不上前台 —— 要么调大 MemTable、
@@ -69,6 +79,17 @@ func (l LevelStats) Score() float64 {
 		return 0
 	}
 	return float64(l.Size) / float64(l.MaxBytes)
+}
+
+// AvgGroupSize 返回平均每批组提交合并了几个写入者。
+//
+// 单线程写入时是 1.0；并发越高、fsync 越慢，这个值越大 ——
+// 它直接反映了 group commit 省下了多少次 fsync。
+func (s Stats) AvgGroupSize() float64 {
+	if s.GroupCommits == 0 {
+		return 0
+	}
+	return float64(s.GroupedWrites) / float64(s.GroupCommits)
 }
 
 // WriteAmplification 返回写放大倍数。没有写入时返回 0。
@@ -106,6 +127,10 @@ func (s Stats) String() string {
 		s.WriteAmplification(), humanBytes(s.UserBytesWritten), humanBytes(s.DiskBytesWritten))
 	fmt.Fprintf(&b, "Compaction 次数: %d，写入等待次数: %d\n",
 		s.CompactionCount, s.WriteStalls)
+	if s.GroupCommits > 0 {
+		fmt.Fprintf(&b, "组提交: %d 批，平均每批 %.2f 个写入者（最多 %d 个）\n",
+			s.GroupCommits, s.AvgGroupSize(), s.MaxGroupSize)
+	}
 
 	if s.BlockCacheHits+s.BlockCacheMisses > 0 {
 		fmt.Fprintf(&b, "Block 缓存命中率: %.1f%%\n", s.BlockCacheHitRate()*100)

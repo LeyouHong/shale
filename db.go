@@ -5,9 +5,9 @@
 //
 // # 现在能用到哪一步
 //
-// 项目按里程碑推进（见 DESIGN.md 第五节），M0~M9 已全部完成：
-// 读、写、扫描、崩溃恢复、分层 compaction、布隆过滤器、块缓存，
-// 以及后台执行的 flush / compaction。
+// 项目按里程碑推进（见 DESIGN.md 第五节），M0~M10 已全部完成：
+// 读、写、扫描、崩溃恢复、分层 compaction、布隆过滤器、块缓存、
+// 后台执行的 flush / compaction，以及并发写的 group commit。
 //
 //	M0 ✓ 骨架、Options、错误、内部 key 编码、Batch 格式
 //	M1 ✓ 跳表 + MemTable（纯内存的读写路径）
@@ -19,6 +19,7 @@
 //	M7 ✓ Leveled Compaction + 分层
 //	M8 ✓ 布隆过滤器 + Block Cache
 //	M9 ✓ 后台 flush / compaction + 并发压测
+//	M10 ✓ Group Commit（并发写合并提交）
 //
 // # 并发模型
 //
@@ -29,6 +30,10 @@
 //
 // 锁顺序固定为 db.mu → tablesMu / bg.mu，绝不颠倒。
 // 反过来嵌套会死锁 —— 这个坑在 M9 真踩到过一次。
+//
+// 写入路径（M10 起）会在写 WAL 时【主动放开 db.mu】，
+// 好让后来的写入者能排进队列、搭上同一班组提交。
+// 这期间由 db.writing 标志挡住所有会切换 MemTable / WAL 的操作。
 //
 // 还没实现的接口会返回 ErrNotImplemented（NewIterator / Flush / CompactAll）。
 //
@@ -89,6 +94,18 @@ type DB struct {
 	// bg 管理后台 flush / compaction 的调度。
 	bg *bgState
 
+	// writers 是等待写入的队列（group commit 用）。
+	// 队首那个是 leader，负责把大家的 batch 合并起来一次写完。
+	writers []*writer
+
+	// writing 表示有 leader 正在【锁外】写 WAL。
+	//
+	// 这期间绝不能切换 MemTable 或 WAL —— 换掉的话，
+	// leader 的数据会落进一个即将被删除的日志里。
+	// Flush / CompactAll / Close 都要先等它变回 false。
+	writing     bool
+	writingCond *sync.Cond
+
 	// WAL：写入 MemTable 之前先把 batch 追加到这里，用于崩溃恢复。
 	walFile *os.File
 	wal     *wal.Writer
@@ -127,10 +144,16 @@ type DB struct {
 	// bloomChecks/bloomSkips 是【已关闭文件】累积下来的计数。
 	// 不能只统计 db.tables 里还开着的 Reader —— compaction 会删掉旧文件，
 	// 它们的计数会随之消失，Stats 就会莫名其妙地倒退。
-	bloomChecks      int64
-	bloomSkips       int64
-	flushCount       int64
-	stallCount       int64
+	bloomChecks int64
+	bloomSkips  int64
+	flushCount  int64
+	stallCount  int64
+
+	// group commit 的效果：合并了多少批、总共代写了多少个 writer。
+	// groupedWrites / groupCount 就是平均每批合并了几个人。
+	groupCount       int64
+	groupedWrites    int64
+	maxGroupSeen     int64
 	compactionCount  int64
 	droppedEntries   int64
 	diskBytesWritten int64
@@ -183,6 +206,7 @@ func Open(dir string, opts *Options) (*DB, error) {
 		vs:         version.NewVersionSet(abs),
 		bg:         newBGState(),
 	}
+	db.writingCond = sync.NewCond(&db.mu)
 
 	// ① 先从 Manifest 恢复元数据：有哪些文件、seq 到哪了、下一个文件号是几。
 	//
@@ -250,7 +274,12 @@ func (db *DB) Close() error {
 	if db.closed {
 		return nil
 	}
+	// 等锁外的日志写入收尾，别把文件从它脚下抽走
+	db.waitForWriteInFlight()
 	db.closed = true
+	// 把还在排队的写入者叫醒，告诉它们数据库关了 ——
+	// 不然它们会永远睡在 cond 上
+	db.drainWriters()
 	err := db.closeWAL()
 	if cerr := db.closeTables(); err == nil {
 		err = cerr
@@ -337,84 +366,6 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	}
 }
 
-// Write 原子地执行一批操作。
-func (db *DB) Write(b *Batch) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.closed {
-		return ErrClosed
-	}
-	if b == nil || b.Empty() {
-		return nil
-	}
-	if db.opts.ReadOnly {
-		return ErrReadOnly
-	}
-	// 先校验，避免写了一半才发现某条记录非法
-	if err := b.Iterate(func(_ ikey.Kind, key, value []byte) error {
-		if err := validateKey(key); err != nil {
-			return err
-		}
-		if int64(len(value)) > db.opts.MemTableSize {
-			return fmt.Errorf("%w: value %d 字节超过 MemTableSize %d",
-				ErrValueTooLarge, len(value), db.opts.MemTableSize)
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	// 先确保有地方可写：必要时冻结当前 MemTable、或者等后台腾出位置。
-	if err := db.makeRoomForWrite(); err != nil {
-		return err
-	}
-
-	// 给整批分配一段连续的序号：第 i 条记录拿到 base+i。
-	//
-	// 「整批共享一个起始 seq」正是原子性在 key 编码层面的落地 ——
-	// 崩溃恢复时只要看 WAL 里这条 batch 记录是否完整，
-	// 就知道这一批是全部生效还是全部没生效。
-	base := db.seq + 1
-	b.SetSeq(base)
-
-	// ① 先落日志。顺序绝不能反：
-	//    先写 MemTable 的话，两步之间崩溃就会出现「内存里有、日志里没有」，
-	//    而内存里的东西马上也没了 —— 数据凭空消失。
-	if db.wal != nil {
-		if err := db.wal.Write(b.Bytes()); err != nil {
-			return fmt.Errorf("shale: 写 WAL 失败: %w", err)
-		}
-		if db.opts.SyncWAL {
-			// fsync 之后才敢说"数据落盘了"，断电也不丢。
-			// 代价是慢一个数量级，所以默认关闭。
-			if err := db.walFile.Sync(); err != nil {
-				return fmt.Errorf("shale: WAL fsync 失败: %w", err)
-			}
-		}
-	}
-
-	// ② 再写内存。到这一步就算进程立刻崩溃，重启也能从日志恢复。
-	var i uint64
-	if err := b.Iterate(func(kind ikey.Kind, key, value []byte) error {
-		db.mem.Add(base+i, kind, key, value)
-		i++
-		return nil
-	}); err != nil {
-		// 走到这里说明 batch 在校验通过之后又出了问题，属于内部错误。
-		// MemTable 可能已经写进去了一部分 —— M2 有了 WAL 之后，
-		// 这种情况会由"WAL 里没有这条记录"来兜底保证原子性。
-		return err
-	}
-	db.seq = base + i - 1
-	db.vs.SetLastSequence(db.seq)
-	db.userBytesWritten += int64(b.Size())
-	db.diskBytesWritten += int64(b.Size())
-
-	// MemTable 写满时不在这里原地刷 —— 只是冻结换新，
-	// 真正的落盘交给后台。前台最多在"后台严重跟不上"时才需要等。
-	return db.makeRoomForWrite()
-}
-
 // Flush 强制把当前 MemTable 刷成 SSTable。主要用于测试和调试。
 func (db *DB) Flush() error {
 	db.mu.Lock()
@@ -425,6 +376,7 @@ func (db *DB) Flush() error {
 	if db.opts.ReadOnly {
 		return ErrReadOnly
 	}
+	db.waitForWriteInFlight()
 	if err := db.freezeMemTable(); err != nil {
 		return err
 	}
@@ -449,6 +401,7 @@ func (db *DB) CompactAll() error {
 		return ErrReadOnly
 	}
 	// 先把内存里的（含等待刷盘的）都落下去，否则它们参与不进合并
+	db.waitForWriteInFlight()
 	if err := db.freezeMemTable(); err != nil {
 		return err
 	}
@@ -473,6 +426,9 @@ func (db *DB) Stats() Stats {
 	}
 	st.ImmutableCount = len(db.imm)
 	st.WriteStalls = db.stallCount
+	st.GroupCommits = db.groupCount
+	st.GroupedWrites = db.groupedWrites
+	st.MaxGroupSize = db.maxGroupSeen
 	st.BlockCacheHits, st.BlockCacheMisses = db.blockCache.Stats()
 	st.BloomFilterChecks, st.BloomFilterSkips = db.bloomChecks, db.bloomSkips
 	db.tablesMu.Lock()
